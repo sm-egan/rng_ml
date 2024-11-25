@@ -5,7 +5,7 @@ import time
 from collections import defaultdict
 
 class RNGBenchmarkV4:
-    def __init__(self, sizes=[1000000, 10000000, 100000000]):
+    def __init__(self, sizes=[np.power(10,n) for n in range(3, 10)]):
         self.sizes = sizes
         self.warmup_rounds = 5
         
@@ -25,7 +25,17 @@ class RNGBenchmarkV4:
             print("TensorFlow GPU memory growth enabled")
         except:
             print("Could not configure TensorFlow GPU memory growth")
-            
+
+    def warmup(self):
+        """Run warmup iterations to ensure GPU is ready"""
+        print("\nRunning warmup iterations...")
+        warmup_size = 1000000
+        for _ in range(self.warmup_rounds):
+            if self.mps_available:
+                _ = torch.rand(warmup_size, device=self.mps_device)
+                torch.mps.synchronize()
+            _ = tf.random.uniform((warmup_size,))
+
     def measure_transfer_time(self, size):
         """Measure time to transfer data to and from GPU"""
         if not self.mps_available:
@@ -98,11 +108,12 @@ class RNGBenchmarkV4:
                 'method': 'tensorflow',
                 'device': 'gpu',
                 'size': size,
-                'time': elapsed,
-                'throughput': size / elapsed / 1e6
+                'total_time': elapsed,
+                'effective_throughput': size / elapsed / 1e6
             }
 
     def run_benchmarks(self, iterations=3):
+        self.warmup()
         results = defaultdict(list)
         
         for size in self.sizes:
@@ -115,24 +126,24 @@ class RNGBenchmarkV4:
                     if result:
                         results[size].append(result)
                         print(f"PyTorch MPS - Size: {size:,}")
-                        print(f"  Compute time: {result['compute_time']:.3f}s")
-                        print(f"  Transfer to GPU: {result['transfer_times']['to_gpu_time']:.3f}s")
-                        print(f"  Transfer to CPU: {result['transfer_times']['to_cpu_time']:.3f}s")
+                        print(f"  Compute time: {result['compute_time']:.5f}s")
+                        print(f"  Transfer to GPU: {result['transfer_times']['to_gpu_time']:.5f}s")
+                        print(f"  Transfer to CPU: {result['transfer_times']['to_cpu_time']:.5f}s")
                         print(f"  Compute throughput: {result['compute_throughput']:.2f} M/s")
                         print(f"  Effective throughput: {result['effective_throughput']:.2f} M/s")
                 
                 result = self.benchmark_tensorflow(size)
                 results[size].append(result)
                 print(f"TensorFlow - Size: {size:,}")
-                print(f"  Total time: {result['time']:.3f}s")
-                print(f"  Throughput: {result['throughput']:.2f} M/s")
+                print(f"  Total time: {result['total_time']:.5f}s")
+                print(f"  Throughput: {result['effective_throughput']:.2f} M/s")
                 
         return results
 
     def print_results(self, results):
         print("\nRNG Performance Benchmark Results:")
         print("-" * 120)
-        print(f"{'Size':<12} {'Method':<12} {'Device':<8} {'Avg Time (s)':<12} {'Throughput (M/s)':<15}")
+        print(f"{'Size':<14} {'Method':<12} {'Device':<8} {'Avg Time (s)':<12} {'Throughput (M/s)':<16} {'% Transfer time':<12}")
         print("-" * 120)
         
         for size in self.sizes:
@@ -143,9 +154,14 @@ class RNGBenchmarkV4:
                 by_method[key].append(r)
             
             for (method, device), method_results in by_method.items():
-                avg_time = sum(r['time'] for r in method_results) / len(method_results)
-                avg_throughput = sum(r['throughput'] for r in method_results) / len(method_results)
-                print(f"{size:<12,} {method:<12} {device:<8} {avg_time:<12.3f} {avg_throughput:<15.2f}")
+                avg_time = sum(r['total_time'] for r in method_results) / len(method_results)
+                avg_throughput = sum(r['effective_throughput'] for r in method_results) / len(method_results)
+                if method == 'pytorch':
+                    avg_percent_transfer_time = sum(r['transfer_times']['total_transfer_time'] / r['total_time'] * 100 for r in method_results) / len(method_results)
+                    print(f"{size:<14,} {method:<12} {device:<8} {avg_time:<12.5f} {avg_throughput:<15.2f} {avg_percent_transfer_time:<12.2f}")
+                else:
+                    print(f"{size:<14,} {method:<12} {device:<8} {avg_time:<12.5f} {avg_throughput:<15.2f}")
+                
 
 if __name__ == "__main__":
     benchmark = RNGBenchmarkV4()

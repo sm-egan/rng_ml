@@ -7,7 +7,8 @@ mkdir -p results
 timestamp=$(date "+%Y%m%d_%H%M%S")
 
 # Run the benchmark and save output silently
-python rng_benchmark.py > "results/rng_benchmark_${timestamp}.txt" 2>&1
+#python rng_benchmark.py > "results/rng_benchmark_${timestamp}.txt" 2>&1
+python $1 > "results/rng_benchmark_${timestamp}.txt" 2>&1
 
 # Print only the location of results file
 echo "Results saved to: results/rng_benchmark_${timestamp}.txt"
