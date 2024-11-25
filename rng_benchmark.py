@@ -2,166 +2,137 @@ import numpy as np
 import tensorflow as tf
 import torch
 import time
-import psutil
-import os
-from memory_profiler import profile
+from collections import defaultdict
 
-class RNGBenchmark:
-    def __init__(self, size=1000000):
-        self.size = size
-        self.process = psutil.Process(os.getpid())
+class RNGBenchmarkV3:
+    def __init__(self, sizes=[1000000, 10000000, 100000000]):
+        self.sizes = sizes
+        self.warmup_rounds = 5
         
-        # Check for MPS availability and initialize
+        # Device setup and verification
         self.mps_available = torch.backends.mps.is_available()
         if self.mps_available:
             self.mps_device = torch.device("mps")
-            print("MPS (Metal Performance Shaders) is available")
-            # Get initial GPU memory info
-            self._print_gpu_memory_info()
+            print(f"PyTorch MPS device: {self.mps_device}")
+        
+        # TensorFlow device verification
+        tf_devices = tf.config.list_physical_devices()
+        print("TensorFlow devices:", tf_devices)
+        
+    def warmup(self):
+        """Run warmup iterations to ensure GPU is ready"""
+        print("\nRunning warmup iterations...")
+        warmup_size = 1000000
+        for _ in range(self.warmup_rounds):
+            if self.mps_available:
+                _ = torch.rand(warmup_size, device=self.mps_device)
+                torch.mps.synchronize()
+            _ = tf.random.uniform((warmup_size,))
+            
+    def verify_device(self, tensor, expected_device):
+        """Verify tensor is on expected device"""
+        if isinstance(tensor, torch.Tensor):
+            actual_device = tensor.device
+        elif isinstance(tensor, tf.Tensor):
+            actual_device = tensor.device
         else:
-            print("MPS is not available, running PyTorch on CPU only")
-            
-    def _print_gpu_memory_info(self):
-        """Print current GPU memory usage"""
-        if hasattr(torch.mps, 'current_allocated_memory'):
-            print(f"\nGPU Memory Info:")
-            print(f"Current allocated: {torch.mps.current_allocated_memory() / 1024**2:.2f} MB")
-            print(f"Driver allocated: {torch.mps.driver_allocated_memory() / 1024**2:.2f} MB")
-            # Note: On Apple Silicon, available memory is dynamic and shared with systemf
-            
-    def _measure_memory(self):
-        """Return memory usage dictionary with CPU and GPU metrics"""
-        memory_info = {
-            'cpu_memory': self.process.memory_info().rss / 1024**2,  # MB
-            'gpu_memory': 0
-        }
+            actual_device = 'cpu'
+        print(f"Expected device: {expected_device}, Actual device: {actual_device}")
         
-        if self.mps_available:
-            memory_info['gpu_memory'] = torch.mps.current_allocated_memory() / 1024**2  # MB
-            
-        return memory_info
-            
-    @profile
-    def benchmark_numpy(self):
-        start_mem = self._measure_memory()
-        start_time = time.time()
-        
-        # Generate random numbers
-        _ = np.random.random(self.size)
-        
-        elapsed = time.time() - start_time
-        end_mem = self._measure_memory()
-        
-        return {
-            'method': 'numpy',
-            'device': 'cpu',
-            'time': elapsed,
-            'cpu_memory_used': end_mem['cpu_memory'] - start_mem['cpu_memory'],
-            'gpu_memory_used': end_mem['gpu_memory'] - start_mem['gpu_memory'],
-            'throughput': self.size / elapsed / 1e6
-        }
-    
-    @profile
-    def benchmark_pytorch_cpu(self):
-        start_mem = self._measure_memory()
-        start_time = time.time()
-        
-        # Generate random numbers on CPU
-        _ = torch.rand(self.size)
-        
-        elapsed = time.time() - start_time
-        end_mem = self._measure_memory()
-        
-        return {
-            'method': 'pytorch',
-            'device': 'cpu',
-            'time': elapsed,
-            'cpu_memory_used': end_mem['cpu_memory'] - start_mem['cpu_memory'],
-            'gpu_memory_used': end_mem['gpu_memory'] - start_mem['gpu_memory'],
-            'throughput': self.size / elapsed / 1e6
-        }
-    
-    @profile
-    def benchmark_pytorch_mps(self):
+    def benchmark_pytorch_mps(self, size):
         if not self.mps_available:
             return None
             
-        # Clear GPU memory cache
         torch.mps.empty_cache()
         
-        start_mem = self._measure_memory()
-        start_time = time.time()
+        # Start MPS event for more accurate GPU timing
+        start_event = torch.mps.Event(enable_timing=True)
+        end_event = torch.mps.Event(enable_timing=True)
         
-        # Generate random numbers on MPS
-        _ = torch.rand(self.size, device=self.mps_device)
-        # Ensure computation is complete
+        start_event.record()
+        tensor = torch.rand(size, device=self.mps_device)
+        end_event.record()
+        
+        # Verify computation happened on GPU
+        self.verify_device(tensor, self.mps_device)
+        
+        # Wait for computation to finish and get GPU time
         torch.mps.synchronize()
+        gpu_time = start_event.elapsed_time(end_event) / 1000  # Convert ms to s
         
-        elapsed = time.time() - start_time
-        end_mem = self._measure_memory()
+        # Basic statistical verification
+        mean = float(tensor.mean().cpu())
+        std = float(tensor.std().cpu())
+        print(f"PyTorch MPS - Mean: {mean:.3f}, Std: {std:.3f}")
         
         return {
             'method': 'pytorch',
             'device': 'mps',
-            'time': elapsed,
-            'cpu_memory_used': end_mem['cpu_memory'] - start_mem['cpu_memory'],
-            'gpu_memory_used': end_mem['gpu_memory'] - start_mem['gpu_memory'],
-            'throughput': self.size / elapsed / 1e6
+            'size': size,
+            'time': gpu_time,
+            'throughput': size / gpu_time / 1e6
         }
-    
-    @profile
-    def benchmark_tensorflow(self):
-        start_mem = self._measure_memory()
+        
+    def benchmark_tensorflow(self, size):
+        # Similar verification for TensorFlow
         start_time = time.time()
+        tensor = tf.random.uniform((size,))
+        tf.debugging.check_numerics(tensor, "TF tensor validation")
         
-        # Generate random numbers
-        _ = tf.random.uniform((self.size,))
-        
+        # Force execution of the op
+        tensor = tensor.numpy()
         elapsed = time.time() - start_time
-        end_mem = self._measure_memory()
+        
+        mean = float(tf.reduce_mean(tensor))
+        std = float(tf.math.reduce_std(tensor))
+        print(f"TensorFlow - Mean: {mean:.3f}, Std: {std:.3f}")
         
         return {
             'method': 'tensorflow',
-            'device': 'metal',  # TF automatically uses Metal on Apple Silicon
+            'device': 'metal',
+            'size': size,
             'time': elapsed,
-            'cpu_memory_used': end_mem['cpu_memory'] - start_mem['cpu_memory'],
-            'gpu_memory_used': end_mem['gpu_memory'] - start_mem['gpu_memory'],
-            'throughput': self.size / elapsed / 1e6
+            'throughput': size / elapsed / 1e6
         }
 
-    def run_all_benchmarks(self, iterations=5):
-        results = []
-        for i in range(iterations):
-            print(f"\nIteration {i+1}/{iterations}")
-            self._print_gpu_memory_info()
-            results.extend([
-                self.benchmark_numpy(),
-                self.benchmark_pytorch_cpu(),
-                self.benchmark_pytorch_mps(),
-                self.benchmark_tensorflow()
-            ])
-            # Clear GPU memory between iterations
-            if self.mps_available:
-                torch.mps.empty_cache()
+    def run_benchmarks(self, iterations=3):
+        self.warmup()
+        results = defaultdict(list)
+        
+        for size in self.sizes:
+            print(f"\nBenchmarking with size: {size:,}")
+            for i in range(iterations):
+                print(f"\nIteration {i+1}/{iterations}")
+                
+                if self.mps_available:
+                    result = self.benchmark_pytorch_mps(size)
+                    if result:
+                        results[size].append(result)
+                
+                result = self.benchmark_tensorflow(size)
+                results[size].append(result)
+                
         return results
 
-if __name__ == "__main__":
-    benchmark = RNGBenchmark(size=10_000_000)
-    results = benchmark.run_all_benchmarks()
-    
-    # Print results
-    print("\nRNG Performance Benchmark Results:")
-    print("-" * 120)
-    print(f"{'Method':<12} {'Device':<8} {'Avg Time (s)':<12} {'CPU Mem (MB)':<15} {'GPU Mem (MB)':<15} {'Throughput (M/s)':<15}")
-    print("-" * 120)
-    
-    methods = [('numpy', 'cpu'), ('pytorch', 'cpu'), ('pytorch', 'mps'), ('tensorflow', 'metal')]
-    for method, device in methods:
-        method_results = [r for r in results if r and r['method'] == method and r['device'] == device]
-        if method_results:
-            avg_time = sum(r['time'] for r in method_results) / len(method_results)
-            avg_cpu_mem = sum(r['cpu_memory_used'] for r in method_results) / len(method_results)
-            avg_gpu_mem = sum(r['gpu_memory_used'] for r in method_results) / len(method_results)
-            avg_throughput = sum(r['throughput'] for r in method_results) / len(method_results)
+    def print_results(self, results):
+        print("\nRNG Performance Benchmark Results:")
+        print("-" * 120)
+        print(f"{'Size':<12} {'Method':<12} {'Device':<8} {'Avg Time (s)':<12} {'Throughput (M/s)':<15}")
+        print("-" * 120)
+        
+        for size in self.sizes:
+            size_results = results[size]
+            by_method = defaultdict(list)
+            for r in size_results:
+                key = (r['method'], r['device'])
+                by_method[key].append(r)
             
-            print(f"{method:<12} {device:<8} {avg_time:<12.3f} {avg_cpu_mem:<15.2f} {avg_gpu_mem:<15.2f} {avg_throughput:<15.2f}")
+            for (method, device), method_results in by_method.items():
+                avg_time = sum(r['time'] for r in method_results) / len(method_results)
+                avg_throughput = sum(r['throughput'] for r in method_results) / len(method_results)
+                print(f"{size:<12,} {method:<12} {device:<8} {avg_time:<12.3f} {avg_throughput:<15.2f}")
+
+if __name__ == "__main__":
+    benchmark = RNGBenchmarkV3()
+    results = benchmark.run_benchmarks()
+    benchmark.print_results(results)
