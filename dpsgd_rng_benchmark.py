@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.func import vmap, grad, functional_call
 import time
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict
@@ -72,6 +73,10 @@ class DPSGDBenchmark:
         self.model = TransformerEncoder(config).to(config.device)
         self.criterion = nn.CrossEntropyLoss(reduction='none')
         self.timing_stats = {}
+
+        # Extract model state for functional transforms
+        self.params = {k: v.detach() for k, v in self.model.named_parameters()}
+        self.buffers = {k: v.detach() for k, v in self.model.named_buffers()}
         
         print(f"Running on device: {config.device}")
         if config.device == "mps":
@@ -106,6 +111,42 @@ class DPSGDBenchmark:
         )
         return x, y
     
+    def _compute_loss(self, params, buffers, sample, target):
+        """Compute loss for a single example"""
+        predictions = functional_call(self.model, (params, buffers), (sample.unsqueeze(0),))
+        loss = self.criterion(predictions, target.unsqueeze(0))
+        return loss[0]  # Remove batch dimension
+        
+    def _setup_functorch(self):
+        """Setup function transforms for efficient per-example gradients"""
+        # Create function to compute gradients for a single example
+        compute_grad_single = grad(self._compute_loss)
+        
+        # Vectorize it over the batch dimension
+        # None means don't map over that argument (params and buffers)
+        # 0 means map over first dimension of data/targets
+        self.compute_grad_batch = vmap(compute_grad_single, in_dims=(None, None, 0, 0))
+
+    def _compute_per_example_grads_naive(
+        self,
+        data: torch.Tensor,
+        labels: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        """Original naive implementation with separate backward passes"""
+        outputs = self.model(data)
+        losses = self.criterion(outputs, labels)
+        
+        per_example_grads = {}
+        for loss_idx in range(self.config.batch_size):
+            self.model.zero_grad()
+            losses[loss_idx].backward(retain_graph=True)
+            per_example_grads[loss_idx] = {
+                name: param.grad.clone()
+                for name, param in self.model.named_parameters()
+            }
+            
+        return per_example_grads
+
     def _compute_per_example_grads_vectorized(
         self,
         data: torch.Tensor,
@@ -148,6 +189,26 @@ class DPSGDBenchmark:
                 
         return per_example_grads
     
+    def _compute_per_example_grads_functorch(
+        self,
+        data: torch.Tensor,
+        labels: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        """Compute per-example gradients using functorch"""
+        # Compute all gradients in parallel
+        grad_values = self.compute_grad_batch(self.params, self.buffers, data, labels)
+        
+        # Convert to same format as other implementations
+        per_example_grads = {i: {} for i in range(self.config.batch_size)}
+        
+        # Reorganize gradients by example
+        for param_name in self.params.keys():
+            grads = grad_values[param_name]  # [batch_size, ...]
+            for i in range(self.config.batch_size):
+                per_example_grads[i][param_name] = grads[i]
+                
+        return per_example_grads
+
     def _clip_gradients_vectorized(
         self,
         per_example_grads: Dict[int, Dict[str, torch.Tensor]]
