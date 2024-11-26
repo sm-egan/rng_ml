@@ -5,7 +5,7 @@ import time
 from collections import defaultdict
 
 class RNGBenchmarkV4:
-    def __init__(self, sizes=[np.power(10,n) for n in range(3, 10)]):
+    def __init__(self, sizes=[np.power(10,n) for n in range(6, 9)]):
         self.sizes = sizes
         self.warmup_rounds = 5
         
@@ -16,8 +16,12 @@ class RNGBenchmarkV4:
             print(f"PyTorch MPS device: {self.mps_device}")
         
         # TensorFlow GPU setup
-        physical_devices = tf.config.list_physical_devices()
-        print("Available TF devices:", physical_devices)
+        # physical_devices = tf.config.list_physical_devices()
+        # print("Available TF devices:", physical_devices)
+        physical_devices = tf.config.list_physical_devices('GPU')
+        if physical_devices:
+            tf.config.experimental.set_visible_devices(physical_devices[0], 'GPU')
+            print("TensorFlow Metal device enabled:", physical_devices[0])
         
         # Try to configure TensorFlow for GPU/Metal
         try:
@@ -93,6 +97,20 @@ class RNGBenchmarkV4:
             'effective_throughput': size / (gpu_time + transfer_times['total_transfer_time']) / 1e6
         }
         
+    def benchmark_pytorch_cpu(self, size):
+        # Generation timing
+        start_time = time.time()
+        tensor = torch.rand(size)
+        elapsed = time.time() - start_time
+        
+        return {
+            'method': 'pytorch',
+            'device': 'cpu',
+            'size': 'size',
+            'total_time': elapsed,
+            'effective_throughput': size / elapsed / 1e6
+        }
+
     def benchmark_tensorflow(self, size):
         # Force TensorFlow to use GPU if available
         with tf.device('/GPU:0'):
@@ -120,7 +138,13 @@ class RNGBenchmarkV4:
             print(f"\nBenchmarking with size: {size:,}")
             for i in range(iterations):
                 print(f"\nIteration {i+1}/{iterations}")
-                
+
+                result = self.benchmark_pytorch_cpu(size)
+                results[size].append(result)
+                print(f"PyTorch CPU - Size: {size:,}")
+                print(f"  Total time: {result['total_time']:.5f}s")
+                print(f"  Throughput: {result['effective_throughput']:.2f} M/s")
+
                 if self.mps_available:
                     result = self.benchmark_pytorch_mps(size)
                     if result:
@@ -140,6 +164,63 @@ class RNGBenchmarkV4:
                 
         return results
 
+    
+    def save_results(self, results, filename):
+        import json
+        from datetime import datetime
+        import numpy as np
+        
+        # Helper function to convert numpy types to native Python types
+        def convert_to_serializable(obj):
+            if isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            return obj
+
+        # Format results for JSON
+        formatted_results = {
+            'timestamp': datetime.now().isoformat(),
+            'data': {}
+        }
+        
+        for size in self.sizes:
+            formatted_results['data'][str(size)] = []
+            size_results = results[size]
+            for r in size_results:
+                result_dict = {
+                    'method': r['method'],
+                    'device': r['device'],
+                    'size': convert_to_serializable(size)
+                }
+                
+                # Include all timing data for MPS results
+                if r['method'] == 'pytorch' and r['device'] == 'mps':
+                    result_dict.update({
+                        'compute_time': convert_to_serializable(r['compute_time']),
+                        'transfer_to_gpu': convert_to_serializable(r['transfer_times']['to_gpu_time']),
+                        'transfer_to_cpu': convert_to_serializable(r['transfer_times']['to_cpu_time']),
+                        'compute_throughput': convert_to_serializable(r['compute_throughput']),
+                        'effective_throughput': convert_to_serializable(r['effective_throughput'])
+                    })
+                else:
+                    result_dict.update({
+                        'total_time': convert_to_serializable(r['total_time']),
+                        'effective_throughput': convert_to_serializable(r['effective_throughput'])
+                    })
+                
+                formatted_results['data'][str(size)].append(result_dict)
+
+        # Create directory if it doesn't exist
+        import os
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        
+        # Save to file
+        with open(filename, 'w') as f:
+            json.dump(formatted_results, f, indent=2)
+    
     def print_results(self, results):
         print("\nRNG Performance Benchmark Results:")
         print("-" * 120)
@@ -156,7 +237,7 @@ class RNGBenchmarkV4:
             for (method, device), method_results in by_method.items():
                 avg_time = sum(r['total_time'] for r in method_results) / len(method_results)
                 avg_throughput = sum(r['effective_throughput'] for r in method_results) / len(method_results)
-                if method == 'pytorch':
+                if method == 'pytorch' and device =='mps':
                     avg_percent_transfer_time = sum(r['transfer_times']['total_transfer_time'] / r['total_time'] * 100 for r in method_results) / len(method_results)
                     print(f"{size:<14,} {method:<12} {device:<8} {avg_time:<12.5f} {avg_throughput:<15.2f} {avg_percent_transfer_time:<12.2f}")
                 else:
@@ -167,3 +248,4 @@ if __name__ == "__main__":
     benchmark = RNGBenchmarkV4()
     results = benchmark.run_benchmarks()
     benchmark.print_results(results)
+    benchmark.save_results(results, 'results/rng_benchmark.json')
