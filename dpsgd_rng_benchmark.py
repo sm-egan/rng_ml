@@ -2,87 +2,164 @@ import torch
 import torch.nn as nn
 from torch.func import vmap, grad, functional_call
 import time
+from functools import wraps
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict
 import psutil
 import numpy as np
 from contextlib import contextmanager
 import statistics
-
-@contextmanager
-def timer(name: str, stats_dict: Dict[str, list]):
-    """Custom timer context manager for MPS operations"""
-    start = time.perf_counter()
-    yield
-    end = time.perf_counter()
-    duration_ms = (end - start) * 1000
-    if name not in stats_dict:
-        stats_dict[name] = []
-    stats_dict[name].append(duration_ms)
+from opacus import PrivacyEngine
+from opacus.validators import ModuleValidator
+from model import DPTransformerEncoder, ModelConfig
+from opacus.optimizers.optimizer import _generate_noise
+import opacus.optimizers.optimizer as opacus_opt 
 
 @dataclass
-class BenchmarkConfig:
-    """Configuration for benchmark runs"""
-    batch_size: int = 32
-    sequence_length: int = 128
-    hidden_dim: int = 256
-    num_heads: int = 4
-    num_layers: int = 2
+class BenchmarkConfig(ModelConfig):
+    """Configuration for benchmark runs, inheriting from ModelConfig"""
     max_grad_norm: float = 1.0
     noise_multiplier: float = 1.0
     num_iterations: int = 100
     warmup_iterations: int = 10
     device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
-class TransformerEncoder(nn.Module):
-    """Simple transformer encoder model for benchmarking"""
-    def __init__(self, config: BenchmarkConfig):
-        super().__init__()
-        self.config = config
+@contextmanager
+def timer(name: str, stats_dict: Dict[str, list], device: str):
+    """Enhanced timer context manager with proper GPU synchronization"""
+    # Synchronize before starting timer
+    if device == "mps":
+        torch.mps.synchronize()
+    elif device == "cuda":
+        torch.cuda.synchronize()
         
-        # Embedding layer
-        self.embedding = nn.Linear(config.hidden_dim, config.hidden_dim)
+    start = time.perf_counter()
+    yield
+    
+    # Synchronize before stopping timer
+    if device == "mps":
+        torch.mps.synchronize()
+    elif device == "cuda":
+        torch.cuda.synchronize()
         
-        # Transformer encoder layers
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=config.hidden_dim,
-            nhead=config.num_heads,
-            dim_feedforward=config.hidden_dim * 4,
-            batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer, 
-            num_layers=config.num_layers
-        )
-        
-        # Output projection
-        self.classifier = nn.Linear(config.hidden_dim, 2)  # Binary classification
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.embedding(x)
-        x = self.transformer(x)
-        # Global average pooling
-        x = x.mean(dim=1)
-        return self.classifier(x)
+    end = time.perf_counter()
+    duration_ms = (end - start) * 1000
+    if name not in stats_dict:
+        stats_dict[name] = []
+    stats_dict[name].append(duration_ms)
 
 class DPSGDBenchmark:
     """Benchmark different variants of SGD training"""
     
     def __init__(self, config: BenchmarkConfig):
         self.config = config
-        self.model = TransformerEncoder(config).to(config.device)
-        self.criterion = nn.CrossEntropyLoss(reduction='none')
         self.timing_stats = {}
 
-        # Extract model state for functional transforms
-        self.params = {k: v.detach() for k, v in self.model.named_parameters()}
-        self.buffers = {k: v.detach() for k, v in self.model.named_buffers()}
+        def synchronize_device(device):
+            """Helper function to synchronize based on device"""
+            if device == "mps":
+                torch.mps.synchronize()
+            elif device == "cuda":
+                torch.cuda.synchronize()
+                
+        self.synchronize_device = synchronize_device  # Save as instance method
+
+        # Monkey patch opacus noise generation to get timing
+        # Create wrapper with its own timing stats
+        def timed_noise_generation(func):
+            """Enhanced wrapper for noise generation timing with std debugging"""
+            noise_stats = {
+                'noise_generation_zero': [],
+                'noise_generation_nonzero': []
+            }
+            
+            # Static variable to control printing
+            first_call = True
+            
+            @wraps(func)
+            def wrapper(std: float, *args, **kwargs):
+                nonlocal first_call
+                device = args[0].device.type if args else kwargs.get('device', 'cpu')
+                
+                # Print std value only on first call
+                if first_call:
+                    print(f"\nNoise Generation std parameter: {std}")
+                    first_call = False
+                
+                # Synchronize before starting
+                if device == "mps":
+                    torch.mps.synchronize()
+                elif device == "cuda":
+                    torch.cuda.synchronize()
+                    
+                start = time.perf_counter()
+                result = func(std, *args, **kwargs)
+                
+                # Synchronize after noise generation
+                if device == "mps":
+                    torch.mps.synchronize()
+                elif device == "cuda":
+                    torch.cuda.synchronize()
+                    
+                duration = (time.perf_counter() - start) * 1000
+                
+                # Use std to determine if noise was generated
+                if std == 0:
+                    noise_stats['noise_generation_zero'].append(duration)
+                else:
+                    noise_stats['noise_generation_nonzero'].append(duration)
+                
+                return result
+                
+            wrapper.noise_stats = noise_stats
+            return wrapper
+                    
+        # Patch opacus _noise_generation
+        self.original_generate_noise = opacus_opt._generate_noise
+        self.wrapped_noise_gen = timed_noise_generation(self.original_generate_noise)
+        opacus_opt._generate_noise = self.wrapped_noise_gen
+    
+        # Create base model using DP-compatible transformer
+        self.model = DPTransformerEncoder(config).to(config.device)
         
-        print(f"Running on device: {config.device}")
-        if config.device == "mps":
-            print("MPS device properties:")
-            print(f"MPS is built: {torch.backends.mps.is_built()}")
-            print(f"MPS is available: {torch.backends.mps.is_available()}")
+        # Validate and fix model for Opacus compatibility
+        if not ModuleValidator.is_valid(self.model):
+            self.model = ModuleValidator.fix(self.model)
+            
+        # Setup optimizer with a low learning rate for stability
+        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=0.01)
+        self.criterion = nn.CrossEntropyLoss(reduction='none')
+        
+        # Initialize privacy engine with a dummy data loader
+        print("Initializing privacy engine...")
+        self.privacy_engine = PrivacyEngine()
+        
+        # Create dummy data loader with correct batch size
+        dummy_data = torch.utils.data.DataLoader(
+            [(torch.randn(self.config.sequence_length, self.config.hidden_dim), 
+              torch.tensor(0)) for _ in range(100)],
+            batch_size=self.config.batch_size
+        )
+        
+        # Create DP model and optimizer
+        try:
+            print("Setting up private model and optimizer...")
+            self.dp_model, self.dp_optimizer, self.train_loader = self.privacy_engine.make_private(
+                module=self.model,
+                optimizer=self.optimizer,
+                data_loader=dummy_data,
+                noise_multiplier=config.noise_multiplier,
+                max_grad_norm=config.max_grad_norm,
+                poisson_sampling=False  # Disable poisson sampling for benchmarking
+            )
+            print("Private model setup complete.")
+        except Exception as e:
+            print(f"Error during privacy engine setup: {e}")
+            raise
+        
+    def __del__(self):
+        # Restore original function when done
+        opacus_opt._generate_noise = self.original_generate_noise    
     
     def _get_memory_stats(self) -> Dict[str, float]:
         """Get current memory usage"""
@@ -96,7 +173,7 @@ class DPSGDBenchmark:
             stats['gpu_driver'] = torch.mps.driver_allocated_memory() / 1024**2
             
         return stats
-
+    
     def _generate_dummy_batch(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Generate dummy data for benchmarking"""
         x = torch.randn(
@@ -110,229 +187,72 @@ class DPSGDBenchmark:
             device=self.config.device
         )
         return x, y
-    
-    def _compute_loss(self, params, buffers, sample, target):
-        """Compute loss for a single example"""
-        predictions = functional_call(self.model, (params, buffers), (sample.unsqueeze(0),))
-        loss = self.criterion(predictions, target.unsqueeze(0))
-        return loss[0]  # Remove batch dimension
-        
-    def _setup_functorch(self):
-        """Setup function transforms for efficient per-example gradients"""
-        # Create function to compute gradients for a single example
-        compute_grad_single = grad(self._compute_loss)
-        
-        # Vectorize it over the batch dimension
-        # None means don't map over that argument (params and buffers)
-        # 0 means map over first dimension of data/targets
-        self.compute_grad_batch = vmap(compute_grad_single, in_dims=(None, None, 0, 0))
 
-    def _compute_per_example_grads_naive(
-        self,
-        data: torch.Tensor,
-        labels: torch.Tensor
-    ) -> Dict[str, torch.Tensor]:
-        """Original naive implementation with separate backward passes"""
-        outputs = self.model(data)
-        losses = self.criterion(outputs, labels)
-        
-        per_example_grads = {}
-        for loss_idx in range(self.config.batch_size):
-            self.model.zero_grad()
-            losses[loss_idx].backward(retain_graph=True)
-            per_example_grads[loss_idx] = {
-                name: param.grad.clone()
-                for name, param in self.model.named_parameters()
-            }
-            
-        return per_example_grads
-
-    def _compute_per_example_grads_vectorized(
-        self,
-        data: torch.Tensor,
-        labels: torch.Tensor
-    ) -> Dict[int, Dict[str, torch.Tensor]]:
-        """Optimized implementation using vectorized operations"""
-        self.model.zero_grad()
-        
-        # Forward pass
-        outputs = self.model(data)  # [batch_size, num_classes]
-        losses = self.criterion(outputs, labels)  # [batch_size]
-        
-        # Initialize dict to store gradients
-        per_example_grads = {i: {} for i in range(self.config.batch_size)}
-        param_names = [name for name, _ in self.model.named_parameters()]
-        
-        # Compute gradients for the sum of losses to get the Jacobian structure
-        total_grad = torch.zeros_like(losses).requires_grad_(True)
-        gradients = []
-        
-        # Compute per-example gradients using implicit Jacobian-vector products
-        for i in range(self.config.batch_size):
-            # Create mask for this example
-            mask = torch.zeros_like(losses)
-            mask[i] = 1.0
-            
-            # Compute gradients for this example
-            example_grads = torch.autograd.grad(
-                losses,
-                self.model.parameters(),
-                grad_outputs=mask,
-                retain_graph=True,
-                allow_unused=True
-            )
-            
-            # Store gradients
-            for param_idx, param_name in enumerate(param_names):
-                if example_grads[param_idx] is not None:
-                    per_example_grads[i][param_name] = example_grads[param_idx].detach()
-                
-        return per_example_grads
-    
-    def _compute_per_example_grads_functorch(
-        self,
-        data: torch.Tensor,
-        labels: torch.Tensor
-    ) -> Dict[str, torch.Tensor]:
-        """Compute per-example gradients using functorch"""
-        # Compute all gradients in parallel
-        grad_values = self.compute_grad_batch(self.params, self.buffers, data, labels)
-        
-        # Convert to same format as other implementations
-        per_example_grads = {i: {} for i in range(self.config.batch_size)}
-        
-        # Reorganize gradients by example
-        for param_name in self.params.keys():
-            grads = grad_values[param_name]  # [batch_size, ...]
-            for i in range(self.config.batch_size):
-                per_example_grads[i][param_name] = grads[i]
-                
-        return per_example_grads
-
-    def _clip_gradients_vectorized(
-        self,
-        per_example_grads: Dict[int, Dict[str, torch.Tensor]]
-    ) -> Dict[int, Dict[str, torch.Tensor]]:
-        """Optimized gradient clipping implementation"""
-        clipped_grads = {}
-        grad_norms = []
-        
-        # Compute all gradient norms in parallel
-        for idx in range(self.config.batch_size):
-            example_grads = list(per_example_grads[idx].values())
-            flat_grad = torch.cat([g.flatten() for g in example_grads])
-            grad_norms.append(torch.norm(flat_grad))
-        
-        # Convert to tensor for vectorized operations
-        grad_norms = torch.stack(grad_norms)
-        scaling_factors = torch.minimum(
-            torch.ones_like(grad_norms),
-            self.config.max_grad_norm / grad_norms
-        )
-        
-        # Apply scaling factors
-        for idx in range(self.config.batch_size):
-            clipped_grads[idx] = {
-                k: g * scaling_factors[idx]
-                for k, g in per_example_grads[idx].items()
-            }
-            
-        return clipped_grads
-    
-    def _aggregate_grads_vectorized(
-        self,
-        per_example_grads: Dict[int, Dict[str, torch.Tensor]],
-        add_noise: bool = True
-    ) -> Dict[str, torch.Tensor]:
-        """Optimized gradient aggregation"""
-        aggregated = {}
-        
-        # Get all parameter names from first example
-        param_names = list(per_example_grads[0].keys())
-        
-        for param_name in param_names:
-            # Stack gradients for this parameter across all examples
-            param_grads = torch.stack([
-                per_example_grads[idx][param_name]
-                for idx in range(self.config.batch_size)
-            ])
-            
-            # Compute mean
-            mean_grad = param_grads.mean(0)
-            
-            if add_noise:
-                noise = torch.randn_like(mean_grad) * \
-                    self.config.noise_multiplier * \
-                    self.config.max_grad_norm / \
-                    self.config.batch_size
-                mean_grad += noise
-                
-            aggregated[param_name] = mean_grad
-            
-        return aggregated
-    
     def _benchmark_step(
         self,
         variant: str,
         data: torch.Tensor,
-        labels: torch.Tensor,
-        use_optimized: bool = True
+        labels: torch.Tensor
     ) -> Tuple[float, Dict[str, float]]:
-        """Run and time a single training step"""
+        """Run and time a single training step with noise debugging"""
+        # Initialize class variable for first run tracking if it doesn't exist
+        if not hasattr(self, '_first_runs'):
+            self._first_runs = {'dpsgd': True, 'dpsgd_no_noise': True, 'vanilla': True}
+        
+        # Use privacy engine's built-in noise control
+        if variant == "dpsgd_no_noise":
+            self.privacy_engine.noise_multiplier = 0.0
+            if hasattr(self.dp_optimizer, 'noise_multiplier'):
+                self.dp_optimizer.noise_multiplier = 0.0
+            
+            if self._first_runs[variant]:
+                print("\nDPSGD_NO_NOISE Settings:")
+                print(f"Privacy Engine noise_multiplier: {self.privacy_engine.noise_multiplier}")
+                print(f"Optimizer noise_multiplier: {getattr(self.dp_optimizer, 'noise_multiplier', 'Not found')}")
+                self._first_runs[variant] = False
+        else:
+            self.privacy_engine.noise_multiplier = self.config.noise_multiplier
+            if hasattr(self.dp_optimizer, 'noise_multiplier'):
+                self.dp_optimizer.noise_multiplier = self.config.noise_multiplier
+                
+            if self._first_runs.get(variant, True):
+                print(f"\n{variant.upper()} Settings:")
+                print(f"Privacy Engine noise_multiplier: {self.privacy_engine.noise_multiplier}")
+                print(f"Optimizer noise_multiplier: {getattr(self.dp_optimizer, 'noise_multiplier', 'Not found')}")
+                self._first_runs[variant] = False
+        
+        # Synchronize before starting step timer
+        self.synchronize_device(self.config.device)
         start_time = time.perf_counter()
         
-        compute_grads_fn = (
-            self._compute_per_example_grads_vectorized if use_optimized 
-            else self._compute_per_example_grads_naive
-        )
-        clip_grads_fn = (
-            self._clip_gradients_vectorized if use_optimized
-            else self._clip_gradients
-        )
-        aggregate_fn = (
-            self._aggregate_grads_vectorized if use_optimized
-            else self._aggregate_grads
-        )
-        
-        if variant == "dpsgd":
-            with timer("compute_grads", self.timing_stats):
-                per_example_grads = compute_grads_fn(data, labels)
-            
-            with timer("clip_grads", self.timing_stats):
-                clipped_grads = clip_grads_fn(per_example_grads)
-            
-            with timer("noise_generation", self.timing_stats):
-                final_grads = aggregate_fn(clipped_grads, add_noise=True)
-            
-        elif variant == "dpsgd_no_noise":
-            with timer("compute_grads", self.timing_stats):
-                per_example_grads = compute_grads_fn(data, labels)
-            
-            with timer("clip_grads", self.timing_stats):
-                clipped_grads = clip_grads_fn(per_example_grads)
-            
-            with timer("aggregate_only", self.timing_stats):
-                final_grads = aggregate_fn(clipped_grads, add_noise=False)
+        if variant in ["dpsgd", "dpsgd_no_noise"]:
+            model = self.dp_model
+            optimizer = self.dp_optimizer
+                
+            with timer("forward_backward", self.timing_stats, self.config.device):
+                predictions = model(data)
+                loss = self.criterion(predictions, labels).mean()
+                optimizer.zero_grad()
+                loss.backward()
+                
+            with timer("optimizer_step", self.timing_stats, self.config.device):
+                optimizer.step()
             
         else:  # vanilla SGD
-            with timer("standard_sgd", self.timing_stats):
-                outputs = self.model(data)
-                loss = self.criterion(outputs, labels).mean()
+            with timer("standard_sgd", self.timing_stats, self.config.device):
+                predictions = self.model(data)
+                loss = self.criterion(predictions, labels).mean()
+                self.optimizer.zero_grad()
                 loss.backward()
-                final_grads = {
-                    name: param.grad
-                    for name, param in self.model.named_parameters()
-                }
+                self.optimizer.step()
         
-        # Ensure MPS is synchronized
-        if self.config.device == "mps":
-            torch.mps.synchronize()
-            
+        self.synchronize_device(self.config.device)
         step_time = time.perf_counter() - start_time
         memory_stats = self._get_memory_stats()
             
         return step_time, memory_stats
-            
+
+    
     def run_benchmark(self) -> Dict[str, Dict[str, float]]:
         """Run full benchmark suite"""
         variants = ["dpsgd", "dpsgd_no_noise", "vanilla"]
@@ -340,7 +260,10 @@ class DPSGDBenchmark:
             'time': [], 
             'cpu_memory': [], 
             'gpu_current': [],
-            'gpu_driver': []
+            'gpu_driver': [],
+            'max_cpu_memory': 0,
+            'max_gpu_current': 0,
+            'max_gpu_driver': 0
         } for v in variants}
         
         # Warmup
@@ -352,7 +275,9 @@ class DPSGDBenchmark:
                 
         # Reset timing stats after warmup
         self.timing_stats.clear()
-                
+        self.wrapped_noise_gen.noise_stats['noise_generation_nonzero'].clear()
+        self.wrapped_noise_gen.noise_stats['noise_generation_zero'].clear()
+        
         # Main benchmark loop
         print("\nRunning main benchmark...")
         for i in range(self.config.num_iterations):
@@ -366,10 +291,25 @@ class DPSGDBenchmark:
                 
                 results[variant]['time'].append(step_time)
                 results[variant]['cpu_memory'].append(memory_stats['cpu_memory'])
+                
                 if self.config.device == "mps":
                     results[variant]['gpu_current'].append(memory_stats['gpu_current'])
                     results[variant]['gpu_driver'].append(memory_stats['gpu_driver'])
-                
+                    
+                    # Track peak memory
+                    results[variant]['max_cpu_memory'] = max(
+                        results[variant]['max_cpu_memory'],
+                        memory_stats['cpu_memory']
+                    )
+                    results[variant]['max_gpu_current'] = max(
+                        results[variant]['max_gpu_current'],
+                        memory_stats['gpu_current']
+                    )
+                    results[variant]['max_gpu_driver'] = max(
+                        results[variant]['max_gpu_driver'],
+                        memory_stats['gpu_driver']
+                    )
+        
         # Calculate statistics
         summary = {}
         for variant in variants:
@@ -379,52 +319,72 @@ class DPSGDBenchmark:
                 'avg_cpu_memory': np.mean(results[variant]['cpu_memory']),
                 'avg_gpu_current': np.mean(results[variant]['gpu_current']) if self.config.device == "mps" else 0,
                 'avg_gpu_driver': np.mean(results[variant]['gpu_driver']) if self.config.device == "mps" else 0,
+                'max_cpu_memory': results[variant]['max_cpu_memory'],
+                'max_gpu_current': results[variant]['max_gpu_current'],
+                'max_gpu_driver': results[variant]['max_gpu_driver'],
                 'throughput': self.config.batch_size / np.mean(results[variant]['time'])
             }
             
         return summary
 
     def print_timing_statistics(self):
-        """Print detailed timing statistics"""
-        print("\nDetailed Timing Statistics (ms):")
-        print("-" * 80)
+        """Print detailed timing statistics including separated noise generation times"""
+        # Regular timing stats
         for operation, times in self.timing_stats.items():
             mean_time = statistics.mean(times)
             std_time = statistics.stdev(times) if len(times) > 1 else 0
             print(f"{operation:20s}: {mean_time:8.2f} ± {std_time:6.2f}")
+            
+        # Separated noise generation stats
+        for key, times in self.wrapped_noise_gen.noise_stats.items():
+            if times:  # Only print if we have measurements
+                mean_time = statistics.mean(times)
+                std_time = statistics.stdev(times) if len(times) > 1 else 0
+                print(f"{key:20s}: {mean_time:8.4f} ± {std_time:6.4f}")
 
 def main():
     config = BenchmarkConfig()
     
-    # Run naive implementation first
-    print("\nRunning benchmark with naive implementation...")
-    benchmark_naive = DPSGDBenchmark(config)
-    results_naive = benchmark_naive.run_benchmark()
+    print("\nRunning benchmark with Opacus implementation...")
+    benchmark = DPSGDBenchmark(config)
+    results = benchmark.run_benchmark()
     
-    # Run optimized implementation
-    print("\nRunning benchmark with optimized implementation...")
-    benchmark_opt = DPSGDBenchmark(config)
-    results_opt = benchmark_opt.run_benchmark()
-    
-    # Print comparison
-    print("\nComparison of Implementations:")
+    # Print results with detailed memory information
+    print("\nBenchmark Results:")
     print("-" * 80)
-    
-    variants = ["dpsgd", "dpsgd_no_noise", "vanilla"]
-    for variant in variants:
-        naive_time = results_naive[variant]['avg_time'] * 1000
-        opt_time = results_opt[variant]['avg_time'] * 1000
-        speedup = naive_time / opt_time if opt_time > 0 else 0
-        
+    for variant, metrics in results.items():
         print(f"\n{variant.upper()}:")
-        print(f"Naive implementation: {naive_time:.2f} ms")
-        print(f"Optimized implementation: {opt_time:.2f} ms")
-        print(f"Speedup: {speedup:.2f}x")
+        print(f"Average step time: {metrics['avg_time']*1000:.2f} ms (± {metrics['std_time']*1000:.2f} ms)")
+        print(f"Throughput: {metrics['throughput']:.2f} examples/sec")
+        
+        # Memory statistics
+        print("\nMemory Usage:")
+        print(f"CPU Memory: {metrics['avg_cpu_memory']:.2f} MB")
+        if config.device == "mps":
+            print(f"GPU Current Memory: {metrics['avg_gpu_current']:.2f} MB")
+            print(f"GPU Driver Memory: {metrics['avg_gpu_driver']:.2f} MB")
+            
+        # Memory peak differences
+        if 'max_cpu_memory' in metrics:
+            print(f"\nPeak Memory Usage:")
+            print(f"Peak CPU Memory: {metrics['max_cpu_memory']:.2f} MB")
+            if config.device == "mps":
+                print(f"Peak GPU Current Memory: {metrics['max_gpu_current']:.2f} MB")
+                print(f"Peak GPU Driver Memory: {metrics['max_gpu_driver']:.2f} MB")
     
-    # Print detailed timing statistics for optimized version
-    print("\nDetailed Timing Statistics (Optimized Implementation):")
+    # Compare memory usage between variants
+    if all(v in results for v in ['dpsgd', 'vanilla']):
+        print("\nMemory Overhead Analysis:")
+        print("-" * 80)
+        dp_mem = results['dpsgd']['avg_gpu_current']
+        vanilla_mem = results['vanilla']['avg_gpu_current']
+        mem_overhead = (dp_mem - vanilla_mem) / vanilla_mem * 100
+        print(f"DP-SGD Memory Overhead: {mem_overhead:.1f}% compared to vanilla SGD")
+    
+    # Print detailed timing statistics
+    print("\nDetailed Timing Statistics:")
     print("-" * 80)
-    benchmark_opt.print_timing_statistics()
+    benchmark.print_timing_statistics()
 
 if __name__ == "__main__":
     main()

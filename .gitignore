@@ -1,11 +1,26 @@
 *.pyc
-__pycache__/
 .pytest_cache/
-.env
-.venv/
 *.log
 .DS_Store
 .idea/
 .vscode/
-rng_accel_env/
 results/
+
+# Python virtual environment
+rng_accel_env/
+.env
+.venv/
+*.pyenv
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+
+# Torch specific
+*.pt
+*.pth
