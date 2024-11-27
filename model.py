@@ -7,7 +7,7 @@ from dataclasses import dataclass
 class ModelConfig:
     batch_size: int = 32
     # For transformer
-    sequence_length: int = 512
+    sequence_length: int = 128
     hidden_dim: int = 256
     num_heads: int = 4
     num_layers: int = 2

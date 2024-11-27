@@ -11,9 +11,9 @@ from contextlib import contextmanager
 import statistics
 from opacus import PrivacyEngine
 from opacus.validators import ModuleValidator
-from model import DPTransformerEncoder, ModelConfig
+from model import DPTransformerEncoder, DPResNet, ModelConfig, create_dp_resnet18
 from opacus.optimizers.optimizer import _generate_noise
-import opacus.optimizers.optimizer as opacus_opt 
+import opacus.optimizers.optimizer as opacus_opt
 
 @dataclass
 class BenchmarkConfig(ModelConfig):
@@ -119,8 +119,11 @@ class DPSGDBenchmark:
         self.wrapped_noise_gen = timed_noise_generation(self.original_generate_noise)
         opacus_opt._generate_noise = self.wrapped_noise_gen
     
-        # Create base model using DP-compatible transformer
-        self.model = DPTransformerEncoder(config).to(config.device)
+        # Create base model based on config type
+        if config.model_type == "resnet":
+            self.model = create_dp_resnet18().to(config.device)
+        else:  # default to transformer
+            self.model = DPTransformerEncoder(config).to(config.device)
         
         # Validate and fix model for Opacus compatibility
         if not ModuleValidator.is_valid(self.model):
@@ -174,14 +177,25 @@ class DPSGDBenchmark:
             
         return stats
     
+    # And update _generate_dummy_batch to handle both model types:
     def _generate_dummy_batch(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Generate dummy data for benchmarking"""
-        x = torch.randn(
-            self.config.batch_size, 
-            self.config.sequence_length, 
-            self.config.hidden_dim, 
-            device=self.config.device
-        )
+        """Generate dummy data for benchmarking based on model type"""
+        if self.config.model_type == "resnet":
+            x = torch.randn(
+                self.config.batch_size, 
+                self.config.in_channels,
+                self.config.image_size,
+                self.config.image_size,
+                device=self.config.device
+            )
+        else:  # transformer
+            x = torch.randn(
+                self.config.batch_size, 
+                self.config.sequence_length, 
+                self.config.hidden_dim, 
+                device=self.config.device
+            )
+        
         y = torch.randint(
             0, 2, (self.config.batch_size,), 
             device=self.config.device
@@ -343,9 +357,10 @@ class DPSGDBenchmark:
                 print(f"{key:20s}: {mean_time:8.4f} ± {std_time:6.4f}")
 
 def main():
-    config = BenchmarkConfig()
+    # Run one model at a time based on command line argument or config
+    config = BenchmarkConfig(model_type="resnet")  # or "transformer"
     
-    print("\nRunning benchmark with Opacus implementation...")
+    print(f"\nRunning {config.model_type} benchmark...")
     benchmark = DPSGDBenchmark(config)
     results = benchmark.run_benchmark()
     
@@ -360,7 +375,7 @@ def main():
         # Memory statistics
         print("\nMemory Usage:")
         print(f"CPU Memory: {metrics['avg_cpu_memory']:.2f} MB")
-        if config.device == "mps":
+        if 'avg_gpu_current' in metrics and metrics['avg_gpu_current'] > 0:
             print(f"GPU Current Memory: {metrics['avg_gpu_current']:.2f} MB")
             print(f"GPU Driver Memory: {metrics['avg_gpu_driver']:.2f} MB")
             
@@ -368,7 +383,7 @@ def main():
         if 'max_cpu_memory' in metrics:
             print(f"\nPeak Memory Usage:")
             print(f"Peak CPU Memory: {metrics['max_cpu_memory']:.2f} MB")
-            if config.device == "mps":
+            if 'max_gpu_current' in metrics and metrics['max_gpu_current'] > 0:
                 print(f"Peak GPU Current Memory: {metrics['max_gpu_current']:.2f} MB")
                 print(f"Peak GPU Driver Memory: {metrics['max_gpu_driver']:.2f} MB")
     
@@ -385,6 +400,7 @@ def main():
     print("\nDetailed Timing Statistics:")
     print("-" * 80)
     benchmark.print_timing_statistics()
+
 
 if __name__ == "__main__":
     main()
