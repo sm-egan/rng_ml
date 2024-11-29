@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn 
+import torchvision
 from opacus.layers import DPMultiheadAttention
 from dataclasses import dataclass
 
@@ -149,6 +150,38 @@ class DPResNet(nn.Module):
         out = self.fc(out)
         return out
 
+def convert_batchnorm_modules(module: nn.Module):
+    """Helper function to convert BatchNorm to GroupNorm"""
+    module_output = module
+    if isinstance(module, nn.BatchNorm2d):
+        # Assuming num_groups=8 like before, but this could be tuned
+        module_output = nn.GroupNorm(
+            num_groups=8,
+            num_channels=module.num_features
+        )
+    for name, child in module.named_children():
+        module_output.add_module(
+            name, convert_batchnorm_modules(child)
+        )
+    return module_output
+
 # Function to create ResNet18
 def create_dp_resnet18():
-    return DPResNet(BasicBlock, [2, 2, 2, 2])
+    #return DPResNet(BasicBlock, [2, 2, 2, 2])
+
+    """Create DP-compatible ResNet18 from torchvision"""
+    import torchvision.models as models
+    
+    # Get the standard ResNet18
+    model = models.resnet18(weights=None)  # No pre-trained weights needed for benchmark
+    
+    # Convert all BatchNorm layers to GroupNorm
+    model = convert_batchnorm_modules(model)
+    
+    # Modify first conv layer to accept smaller images if needed
+    # model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+    
+    # Modify final layer for binary classification
+    model.fc = nn.Linear(model.fc.in_features, 2)
+    
+    return model

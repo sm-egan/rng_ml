@@ -14,6 +14,7 @@ from opacus.validators import ModuleValidator
 from model import DPTransformerEncoder, DPResNet, ModelConfig, create_dp_resnet18
 from opacus.optimizers.optimizer import _generate_noise
 import opacus.optimizers.optimizer as opacus_opt
+from opacus.utils.batch_memory_manager import BatchMemoryManager
 
 @dataclass
 class BenchmarkConfig(ModelConfig):
@@ -22,6 +23,7 @@ class BenchmarkConfig(ModelConfig):
     noise_multiplier: float = 1.0
     num_iterations: int = 100
     warmup_iterations: int = 10
+    poisson_sampling: bool = True
     device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
 @contextmanager
@@ -144,22 +146,30 @@ class DPSGDBenchmark:
             batch_size=self.config.batch_size
         )
         
-        # Create DP model and optimizer
+        # Create the dataset and loader first
+        print("Creating dummy dataset...")
+        dummy_dataset = self.create_dummy_dataset()
+        self.train_loader = torch.utils.data.DataLoader(
+            dummy_dataset,
+            batch_size=self.config.batch_size,
+        )
+
+        # Make DP model and optimizer
         try:
             print("Setting up private model and optimizer...")
             self.dp_model, self.dp_optimizer, self.train_loader = self.privacy_engine.make_private(
                 module=self.model,
                 optimizer=self.optimizer,
-                data_loader=dummy_data,
+                data_loader=self.train_loader,  # Use the loader we just created
                 noise_multiplier=config.noise_multiplier,
                 max_grad_norm=config.max_grad_norm,
-                poisson_sampling=False  # Disable poisson sampling for benchmarking
+                poisson_sampling=config.poisson_sampling  # Now this should work with BatchMemoryManager
             )
             print("Private model setup complete.")
         except Exception as e:
             print(f"Error during privacy engine setup: {e}")
             raise
-        
+            
     def __del__(self):
         # Restore original function when done
         opacus_opt._generate_noise = self.original_generate_noise    
@@ -177,6 +187,27 @@ class DPSGDBenchmark:
             
         return stats
     
+    def create_dummy_dataset(self, size: int = 50000) -> torch.utils.data.Dataset:
+        """Create a more realistic sized dummy dataset"""
+        if self.config.model_type == "resnet":
+            data = torch.randn(
+                size,
+                self.config.in_channels,
+                self.config.image_size,
+                self.config.image_size,
+                device=self.config.device  # Add device here
+            )
+        else:  # transformer
+            data = torch.randn(
+                size,
+                self.config.sequence_length,
+                self.config.hidden_dim,
+                device=self.config.device  # Add device here
+            )
+        
+        labels = torch.randint(0, 2, (size,), device=self.config.device)  # Add device here
+        return torch.utils.data.TensorDataset(data, labels)
+
     # And update _generate_dummy_batch to handle both model types:
     def _generate_dummy_batch(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Generate dummy data for benchmarking based on model type"""
@@ -212,64 +243,49 @@ class DPSGDBenchmark:
         # Initialize class variable for first run tracking if it doesn't exist
         if not hasattr(self, '_first_runs'):
             self._first_runs = {'dpsgd': True, 'dpsgd_no_noise': True, 'vanilla': True}
-        
+            
         # Use privacy engine's built-in noise control
         if variant == "dpsgd_no_noise":
             self.privacy_engine.noise_multiplier = 0.0
             if hasattr(self.dp_optimizer, 'noise_multiplier'):
                 self.dp_optimizer.noise_multiplier = 0.0
-            
-            if self._first_runs[variant]:
-                print("\nDPSGD_NO_NOISE Settings:")
-                print(f"Privacy Engine noise_multiplier: {self.privacy_engine.noise_multiplier}")
-                print(f"Optimizer noise_multiplier: {getattr(self.dp_optimizer, 'noise_multiplier', 'Not found')}")
-                self._first_runs[variant] = False
         else:
             self.privacy_engine.noise_multiplier = self.config.noise_multiplier
             if hasattr(self.dp_optimizer, 'noise_multiplier'):
                 self.dp_optimizer.noise_multiplier = self.config.noise_multiplier
-                
-            if self._first_runs.get(variant, True):
-                print(f"\n{variant.upper()} Settings:")
-                print(f"Privacy Engine noise_multiplier: {self.privacy_engine.noise_multiplier}")
-                print(f"Optimizer noise_multiplier: {getattr(self.dp_optimizer, 'noise_multiplier', 'Not found')}")
-                self._first_runs[variant] = False
+
+        # Log first run settings        
+        if self._first_runs.get(variant, True):
+            print(f"\n{variant.upper()} Settings:")
+            print(f"Privacy Engine noise_multiplier: {self.privacy_engine.noise_multiplier}")
+            print(f"Optimizer noise_multiplier: {getattr(self.dp_optimizer, 'noise_multiplier', 'Not found')}")
+            self._first_runs[variant] = False
         
         # Synchronize before starting step timer
         self.synchronize_device(self.config.device)
         start_time = time.perf_counter()
         
-        if variant in ["dpsgd", "dpsgd_no_noise"]:
-            model = self.dp_model
-            optimizer = self.dp_optimizer
+        model = self.dp_model
+        optimizer = self.dp_optimizer
                 
-            with timer("forward_backward", self.timing_stats, self.config.device):
-                predictions = model(data)
-                loss = self.criterion(predictions, labels).mean()
-                optimizer.zero_grad()
-                loss.backward()
-                
-            with timer("optimizer_step", self.timing_stats, self.config.device):
-                optimizer.step()
+        with timer("forward_backward", self.timing_stats, self.config.device):
+            predictions = model(data)
+            loss = self.criterion(predictions, labels).mean()
+            optimizer.zero_grad()
+            loss.backward()
             
-        else:  # vanilla SGD
-            with timer("standard_sgd", self.timing_stats, self.config.device):
-                predictions = self.model(data)
-                loss = self.criterion(predictions, labels).mean()
-                self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
+        with timer("optimizer_step", self.timing_stats, self.config.device):
+            optimizer.step()
         
         self.synchronize_device(self.config.device)
         step_time = time.perf_counter() - start_time
         memory_stats = self._get_memory_stats()
             
         return step_time, memory_stats
-
     
     def run_benchmark(self) -> Dict[str, Dict[str, float]]:
         """Run full benchmark suite"""
-        variants = ["dpsgd", "dpsgd_no_noise", "vanilla"]
+        variants = ["dpsgd", "dpsgd_no_noise"]  # Remove vanilla SGD
         results = {v: {
             'time': [], 
             'cpu_memory': [], 
@@ -279,14 +295,20 @@ class DPSGDBenchmark:
             'max_gpu_current': 0,
             'max_gpu_driver': 0
         } for v in variants}
-        
         # Warmup
         print("\nWarmup...")
         for _ in range(self.config.warmup_iterations):
-            data, labels = self._generate_dummy_batch()
             for variant in variants:
-                self._benchmark_step(variant, data, labels)
-                
+                with BatchMemoryManager(
+                    data_loader=self.train_loader,
+                    max_physical_batch_size=self.config.batch_size,
+                    optimizer=self.dp_optimizer
+                ) as memory_safe_data_loader:
+                    for batch in memory_safe_data_loader:
+                        data, labels = batch
+                        self._benchmark_step(variant, data, labels)
+                        break  # Only one batch for warmup
+                        
         # Reset timing stats after warmup
         self.timing_stats.clear()
         self.wrapped_noise_gen.noise_stats['noise_generation_nonzero'].clear()
@@ -298,11 +320,23 @@ class DPSGDBenchmark:
             if i % 10 == 0:
                 print(f"Iteration {i}/{self.config.num_iterations}")
             
-            data, labels = self._generate_dummy_batch()
-            
             for variant in variants:
-                step_time, memory_stats = self._benchmark_step(variant, data, labels)
+                with BatchMemoryManager(
+                    data_loader=self.train_loader,
+                    max_physical_batch_size=self.config.batch_size,
+                    optimizer=self.dp_optimizer
+                ) as memory_safe_data_loader:
+                    # Time the data loading/sampling specifically
+                    with timer("data_sampling", self.timing_stats, self.config.device):
+                        for batch in memory_safe_data_loader:
+                            data, labels = batch
+                            break  # Get timing for just the first batch
+                    for batch in memory_safe_data_loader:
+                        data, labels = batch
+                        step_time, memory_stats = self._benchmark_step(variant, data, labels)
+                        break  # Only process one batch per iteration
                 
+                # Record results
                 results[variant]['time'].append(step_time)
                 results[variant]['cpu_memory'].append(memory_stats['cpu_memory'])
                 
@@ -324,7 +358,7 @@ class DPSGDBenchmark:
                         memory_stats['gpu_driver']
                     )
         
-        # Calculate statistics
+        # Calculate statistics (same as before)
         summary = {}
         for variant in variants:
             summary[variant] = {
@@ -338,7 +372,7 @@ class DPSGDBenchmark:
                 'max_gpu_driver': results[variant]['max_gpu_driver'],
                 'throughput': self.config.batch_size / np.mean(results[variant]['time'])
             }
-            
+                
         return summary
 
     def print_timing_statistics(self):
@@ -356,13 +390,18 @@ class DPSGDBenchmark:
                 std_time = statistics.stdev(times) if len(times) > 1 else 0
                 print(f"{key:20s}: {mean_time:8.4f} ± {std_time:6.4f}")
 
-def main():
+def main(model_type = "resnet", poisson_sampling = True):
     # Run one model at a time based on command line argument or config
-    config = BenchmarkConfig(model_type="resnet")  # or "transformer"
+    config = BenchmarkConfig(model_type=model_type, poisson_sampling=poisson_sampling)
     
-    print(f"\nRunning {config.model_type} benchmark...")
+    print(f"\nRunning {config.model_type} benchmark {'WITH' if config.poisson_sampling else 'WITHOUT'} poisson subsampling")
     benchmark = DPSGDBenchmark(config)
     results = benchmark.run_benchmark()
+    
+    # Add clear indicator of sampling mode
+    print("\n" + "="*50)
+    print(f"SAMPLING MODE: {'POISSON' if config.poisson_sampling else 'STANDARD'}")
+    print("="*50 + "\n")
     
     # Print results with detailed memory information
     print("\nBenchmark Results:")
@@ -387,20 +426,10 @@ def main():
                 print(f"Peak GPU Current Memory: {metrics['max_gpu_current']:.2f} MB")
                 print(f"Peak GPU Driver Memory: {metrics['max_gpu_driver']:.2f} MB")
     
-    # Compare memory usage between variants
-    if all(v in results for v in ['dpsgd', 'vanilla']):
-        print("\nMemory Overhead Analysis:")
-        print("-" * 80)
-        dp_mem = results['dpsgd']['avg_gpu_current']
-        vanilla_mem = results['vanilla']['avg_gpu_current']
-        mem_overhead = (dp_mem - vanilla_mem) / vanilla_mem * 100
-        print(f"DP-SGD Memory Overhead: {mem_overhead:.1f}% compared to vanilla SGD")
-    
     # Print detailed timing statistics
     print("\nDetailed Timing Statistics:")
     print("-" * 80)
     benchmark.print_timing_statistics()
-
 
 if __name__ == "__main__":
     main()
