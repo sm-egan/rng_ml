@@ -5,7 +5,7 @@ import time
 from collections import defaultdict
 
 class RNGBenchmarkV4:
-    def __init__(self, sizes=[np.power(10,n) for n in range(6, 9)]):
+    def __init__(self, sizes=[np.power(10,n) for n in range(3, 9)]):
         self.sizes = sizes
         self.warmup_rounds = 5
         
@@ -224,7 +224,7 @@ class RNGBenchmarkV4:
     def print_results(self, results):
         print("\nRNG Performance Benchmark Results:")
         print("-" * 120)
-        print(f"{'Size':<14} {'Method':<12} {'Device':<8} {'Avg Time (s)':<12} {'Throughput (M/s)':<16} {'% Transfer time':<12}")
+        print(f"{'Size':<14} {'Method':<12} {'Device':<8} {'Avg Time (ms)':<14} {'Throughput (M/s)':<16} {'% Transfer time':<12}")
         print("-" * 120)
         
         for size in self.sizes:
@@ -235,13 +235,13 @@ class RNGBenchmarkV4:
                 by_method[key].append(r)
             
             for (method, device), method_results in by_method.items():
-                avg_time = sum(r['total_time'] for r in method_results) / len(method_results)
+                avg_time = sum(r['total_time'] for r in method_results) / len(method_results) * 1000 #convert to ms
                 avg_throughput = sum(r['effective_throughput'] for r in method_results) / len(method_results)
                 if method == 'pytorch' and device =='mps':
                     avg_percent_transfer_time = sum(r['transfer_times']['total_transfer_time'] / r['total_time'] * 100 for r in method_results) / len(method_results)
-                    print(f"{size:<14,} {method:<12} {device:<8} {avg_time:<12.5f} {avg_throughput:<15.2f} {avg_percent_transfer_time:<12.2f}")
+                    print(f"{size:<14,} {method:<12} {device:<8} {avg_time:<14.3f} {avg_throughput:<15.2f} {avg_percent_transfer_time:<12.2f}")
                 else:
-                    print(f"{size:<14,} {method:<12} {device:<8} {avg_time:<12.5f} {avg_throughput:<15.2f}")
+                    print(f"{size:<14,} {method:<12} {device:<8} {avg_time:<14.3f} {avg_throughput:<15.2f}")
                 
 
 if __name__ == "__main__":
