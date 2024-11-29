@@ -36,7 +36,7 @@ class RNGBenchmarkV4:
         warmup_size = 1000000
         for _ in range(self.warmup_rounds):
             if self.mps_available:
-                _ = torch.rand(warmup_size, device=self.mps_device)
+                _ = torch.randn(warmup_size, device=self.mps_device)
                 torch.mps.synchronize()
             _ = tf.random.uniform((warmup_size,))
 
@@ -46,7 +46,7 @@ class RNGBenchmarkV4:
             return None
             
         # CPU to GPU transfer
-        cpu_tensor = torch.rand(size)
+        cpu_tensor = torch.randn(size)
         start_time = time.time()
         gpu_tensor = cpu_tensor.to(self.mps_device)
         torch.mps.synchronize()
@@ -79,7 +79,7 @@ class RNGBenchmarkV4:
         end_event = torch.mps.Event(enable_timing=True)
         
         start_event.record()
-        tensor = torch.rand(size, device=self.mps_device)
+        tensor = torch.randn(size, device=self.mps_device)
         end_event.record()
         
         # Wait for computation and get GPU time
@@ -100,7 +100,7 @@ class RNGBenchmarkV4:
     def benchmark_pytorch_cpu(self, size):
         # Generation timing
         start_time = time.time()
-        tensor = torch.rand(size)
+        tensor = torch.randn(size)
         elapsed = time.time() - start_time
         
         return {
