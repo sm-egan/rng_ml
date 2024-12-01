@@ -15,6 +15,7 @@ from model import DPTransformerEncoder, DPResNet, ModelConfig, create_dp_resnet1
 from opacus.optimizers.optimizer import _generate_noise
 import opacus.optimizers.optimizer as opacus_opt
 from opacus.utils.batch_memory_manager import BatchMemoryManager
+from aes_prng import BatchedAESRandomGenerator, BatchedMPSAESRandomGenerator, AESPrivacyEngine
 
 @dataclass
 class BenchmarkConfig(ModelConfig):
@@ -25,6 +26,7 @@ class BenchmarkConfig(ModelConfig):
     warmup_iterations: int = 10
     poisson_sampling: bool = True
     device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    privacy_engine : PrivacyEngine = PrivacyEngine()
 
 @contextmanager
 def timer(name: str, stats_dict: Dict[str, list], device: str):
@@ -81,28 +83,43 @@ class DPSGDBenchmark:
             @wraps(func)
             def wrapper(std: float, *args, **kwargs):
                 nonlocal first_call
-                device = args[0].device.type if args else kwargs.get('device', 'cpu')
-                
+                #print(f"Debug - std: {std}, args: {args}, kwargs: {kwargs}")  # Debug print
+                device = kwargs['reference'].device.type if 'reference' in kwargs else 'cpu'
+
                 # Print std value only on first call
                 if first_call:
                     print(f"\nNoise Generation std parameter: {std}")
                     first_call = False
                 
-                # Synchronize before starting
-                if device == "mps":
-                    torch.mps.synchronize()
-                elif device == "cuda":
-                    torch.cuda.synchronize()
-                    
-                start = time.perf_counter()
-                result = func(std, *args, **kwargs)
+                # Commented out to start timer closer to result
+                # self.synchronize_device()    
+                # start = time.perf_counter()
+
+                # Modify the call to handle CPU generator
+                if 'generator' in kwargs and kwargs['generator'] is not None:
+                    # Get reference tensor from kwargs
+                    ref_tensor = kwargs.get('reference', None)
+                    if ref_tensor is not None:
+                        ref_device = ref_tensor.device
+                        with torch.no_grad():
+                            self.synchronize_device(self.config.device)    
+                            start = time.perf_counter()
+
+                            kwargs['reference'] = ref_tensor.cpu()  # Move reference to CPU
+                            result = func(std, **kwargs)
+                            result = result.to(ref_device)  # Move result back to original device
+                    else:
+                        self.synchronize_device(self.config.device)    
+                        start = time.perf_counter()
+
+                        result = func(std, **kwargs)
+                else:
+                    self.synchronize_device(self.config.device)    
+                    start = time.perf_counter()
+
+                    result = func(std, **kwargs)
                 
-                # Synchronize after noise generation
-                if device == "mps":
-                    torch.mps.synchronize()
-                elif device == "cuda":
-                    torch.cuda.synchronize()
-                    
+                self.synchronize_device(self.config.device)
                 duration = (time.perf_counter() - start) * 1000
                 
                 # Use std to determine if noise was generated
@@ -136,8 +153,8 @@ class DPSGDBenchmark:
         self.criterion = nn.CrossEntropyLoss(reduction='none')
         
         # Initialize privacy engine with a dummy data loader
-        print("Initializing privacy engine...")
-        self.privacy_engine = PrivacyEngine()
+        print("Initializing privacy engine of type {}".format(type(config.privacy_engine)))
+        self.privacy_engine = config.privacy_engine
         
         # Create dummy data loader with correct batch size
         dummy_data = torch.utils.data.DataLoader(
@@ -242,7 +259,7 @@ class DPSGDBenchmark:
         """Run and time a single training step with noise debugging"""
         # Initialize class variable for first run tracking if it doesn't exist
         if not hasattr(self, '_first_runs'):
-            self._first_runs = {'dpsgd': True, 'dpsgd_no_noise': True, 'vanilla': True}
+            self._first_runs = {'dpsgd': True, 'dpsgd_no_noise': True}
             
         # Use privacy engine's built-in noise control
         if variant == "dpsgd_no_noise":
@@ -261,21 +278,31 @@ class DPSGDBenchmark:
             print(f"Optimizer noise_multiplier: {getattr(self.dp_optimizer, 'noise_multiplier', 'Not found')}")
             self._first_runs[variant] = False
         
+        model = self.dp_model
+        optimizer = self.dp_optimizer
+
         # Synchronize before starting step timer
         self.synchronize_device(self.config.device)
         start_time = time.perf_counter()
         
-        model = self.dp_model
-        optimizer = self.dp_optimizer
+        if variant == "dpsgd_no_noise":
+            with timer("forward_backward_nonoise", self.timing_stats, self.config.device):
+                predictions = model(data)
+                loss = self.criterion(predictions, labels).mean()
+                optimizer.zero_grad()
+                loss.backward()
                 
-        with timer("forward_backward", self.timing_stats, self.config.device):
-            predictions = model(data)
-            loss = self.criterion(predictions, labels).mean()
-            optimizer.zero_grad()
-            loss.backward()
-            
-        with timer("optimizer_step", self.timing_stats, self.config.device):
-            optimizer.step()
+            with timer("optimizer_step_nonoise", self.timing_stats, self.config.device):
+                optimizer.step()
+        elif variant == "dpsgd":
+            with timer("forward_backward_noise", self.timing_stats, self.config.device):
+                predictions = model(data)
+                loss = self.criterion(predictions, labels).mean()
+                optimizer.zero_grad()
+                loss.backward()
+                
+            with timer("optimizer_step_noise", self.timing_stats, self.config.device):
+                optimizer.step()
         
         self.synchronize_device(self.config.device)
         step_time = time.perf_counter() - start_time
@@ -308,6 +335,11 @@ class DPSGDBenchmark:
                         data, labels = batch
                         self._benchmark_step(variant, data, labels)
                         break  # Only one batch for warmup
+        # for _ in range(self.config.warmup_iterations):
+        #     for variant in variants:
+        #         # Just get one batch from the train loader directly
+        #         data, labels = next(iter(self.train_loader))
+        #         self._benchmark_step(variant, data, labels)
                         
         # Reset timing stats after warmup
         self.timing_stats.clear()
@@ -335,6 +367,8 @@ class DPSGDBenchmark:
                         data, labels = batch
                         step_time, memory_stats = self._benchmark_step(variant, data, labels)
                         break  # Only process one batch per iteration
+                # data, labels = next(iter(self.train_loader))
+                # step_time, memory_stats = self._benchmark_step(variant, data, labels)
                 
                 # Record results
                 results[variant]['time'].append(step_time)
@@ -381,18 +415,18 @@ class DPSGDBenchmark:
         for operation, times in self.timing_stats.items():
             mean_time = statistics.mean(times)
             std_time = statistics.stdev(times) if len(times) > 1 else 0
-            print(f"{operation:20s}: {mean_time:8.2f} ± {std_time:6.2f}")
+            print(f"{operation:30s}: {mean_time:8.2f} ± {std_time:6.2f}")
             
         # Separated noise generation stats
         for key, times in self.wrapped_noise_gen.noise_stats.items():
             if times:  # Only print if we have measurements
                 mean_time = statistics.mean(times)
                 std_time = statistics.stdev(times) if len(times) > 1 else 0
-                print(f"{key:20s}: {mean_time:8.4f} ± {std_time:6.4f}")
+                print(f"{key:30s}: {mean_time:8.4f} ± {std_time:6.4f}")
 
-def main(model_type = "resnet", poisson_sampling = True):
+def main(model_type = "transformer", poisson_sampling = True, privacy_engine = AESPrivacyEngine()):
     # Run one model at a time based on command line argument or config
-    config = BenchmarkConfig(model_type=model_type, poisson_sampling=poisson_sampling)
+    config = BenchmarkConfig(model_type=model_type, poisson_sampling=poisson_sampling, privacy_engine=privacy_engine)
     
     print(f"\nRunning {config.model_type} benchmark {'WITH' if config.poisson_sampling else 'WITHOUT'} poisson subsampling")
     benchmark = DPSGDBenchmark(config)
