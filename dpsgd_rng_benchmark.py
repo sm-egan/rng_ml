@@ -267,15 +267,26 @@ class DPSGDBenchmark:
         
         model = self.dp_model
         optimizer = self.dp_optimizer
+        
+        if variant == "dpsgd":
+            with timer("forward_backward_noise", self.timing_stats, self.config.device):
+                predictions = model(data)
+                loss = self.criterion(predictions, labels).mean()
+                optimizer.zero_grad()
+                loss.backward()
                 
-        with timer("forward_backward", self.timing_stats, self.config.device):
-            predictions = model(data)
-            loss = self.criterion(predictions, labels).mean()
-            optimizer.zero_grad()
-            loss.backward()
-            
-        with timer("optimizer_step", self.timing_stats, self.config.device):
-            optimizer.step()
+            with timer("optimizer_step_noise", self.timing_stats, self.config.device):
+                optimizer.step()
+
+        elif variant == "dpsgd_no_noise":
+            with timer("forward_backward_nonoise", self.timing_stats, self.config.device):
+                predictions = model(data)
+                loss = self.criterion(predictions, labels).mean()
+                optimizer.zero_grad()
+                loss.backward()
+                
+            with timer("optimizer_step_nonoise", self.timing_stats, self.config.device):
+                optimizer.step()
         
         self.synchronize_device(self.config.device)
         step_time = time.perf_counter() - start_time
@@ -381,16 +392,16 @@ class DPSGDBenchmark:
         for operation, times in self.timing_stats.items():
             mean_time = statistics.mean(times)
             std_time = statistics.stdev(times) if len(times) > 1 else 0
-            print(f"{operation:20s}: {mean_time:8.2f} ± {std_time:6.2f}")
+            print(f"{operation:30s}: {mean_time:8.2f} ± {std_time:6.2f}")
             
         # Separated noise generation stats
         for key, times in self.wrapped_noise_gen.noise_stats.items():
             if times:  # Only print if we have measurements
                 mean_time = statistics.mean(times)
                 std_time = statistics.stdev(times) if len(times) > 1 else 0
-                print(f"{key:20s}: {mean_time:8.4f} ± {std_time:6.4f}")
+                print(f"{key:30s}: {mean_time:8.4f} ± {std_time:6.4f}")
 
-def main(model_type = "resnet", poisson_sampling = True):
+def main(model_type = "transformer", poisson_sampling = True):
     # Run one model at a time based on command line argument or config
     config = BenchmarkConfig(model_type=model_type, poisson_sampling=poisson_sampling)
     
