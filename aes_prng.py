@@ -174,6 +174,7 @@ class AESPrivacyEngine(PrivacyEngine):
         
         if self.secure_mode:
             # Create CPU generator - it will handle device transfers internally
+            print("Secure mode activated...")
             self.secure_rng = AESGenerator()
         else:
             warnings.warn(

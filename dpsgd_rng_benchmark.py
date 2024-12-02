@@ -80,44 +80,111 @@ class DPSGDBenchmark:
             # Static variable to control printing
             first_call = True
             
+            #Debug version
             @wraps(func)
             def wrapper(std: float, *args, **kwargs):
                 nonlocal first_call
-                #print(f"Debug - std: {std}, args: {args}, kwargs: {kwargs}")  # Debug print
-                device = kwargs['reference'].device.type if 'reference' in kwargs else 'cpu'
-
-                # Print std value only on first call
+                
+                # Get device from reference tensor
+                ref_tensor = kwargs['reference']
+                device = ref_tensor.device.type if 'reference' in kwargs else 'cpu'
+                
                 if first_call:
                     print(f"\nNoise Generation std parameter: {std}")
-                    first_call = False
+                    print("Generator: {}".format(kwargs['generator']))
+                    #first_call = False
                 
-                # Commented out to start timer closer to result
-                # self.synchronize_device()    
-                # start = time.perf_counter()
-
+                # Time each part separately
+                start_total = time.perf_counter()
+                
+                # Synchronize and time pre-generation
+                if device == "mps":
+                    torch.mps.synchronize()
+                elif device == "cuda":
+                    torch.cuda.synchronize()
+                
+                start_gen = time.perf_counter()
+                
                 # Modify the call to handle CPU generator
                 if 'generator' in kwargs and kwargs['generator'] is not None:
-                    # Get reference tensor from kwargs
-                    ref_tensor = kwargs.get('reference', None)
-                    if ref_tensor is not None:
-                        ref_device = ref_tensor.device
-                        with torch.no_grad():
-                            self.synchronize_device(self.config.device)    
-                            start = time.perf_counter()
-
-                            kwargs['reference'] = ref_tensor.cpu()  # Move reference to CPU
-                            result = func(std, **kwargs)
-                            result = result.to(ref_device)  # Move result back to original device
-                    else:
-                        self.synchronize_device(self.config.device)    
-                        start = time.perf_counter()
-
+                    ref_device = ref_tensor.device
+                    with torch.no_grad():
+                        t1 = time.perf_counter()
+                        kwargs['reference'] = ref_tensor.cpu() 
+                        t2 = time.perf_counter()
                         result = func(std, **kwargs)
+                        t3 = time.perf_counter()
+                        result = result.to(ref_device)
+                        t4 = time.perf_counter()
+                        
+                        if first_call:
+                            print(f"Debug timings:")
+                            print(f"  To CPU: {(t2-t1)*1000:.3f}ms")
+                            print(f"  Generate: {(t3-t2)*1000:.3f}ms")
+                            print(f"  To Device: {(t4-t3)*1000:.3f}ms")
                 else:
-                    self.synchronize_device(self.config.device)    
-                    start = time.perf_counter()
-
                     result = func(std, **kwargs)
+                
+                # Synchronize and time post-generation
+                if device == "mps":
+                    torch.mps.synchronize()
+                elif device == "cuda":
+                    torch.cuda.synchronize()
+                    
+                duration = (time.perf_counter() - start_total) * 1000
+                gen_time = (time.perf_counter() - start_gen) * 1000
+                
+                if std == 0:
+                    noise_stats['noise_generation_zero'].append(duration)
+                else:
+                    noise_stats['noise_generation_nonzero'].append(duration)
+                    if first_call:
+                        print(f"Total time: {duration:.3f}ms")
+                        print(f"Generation time: {gen_time:.3f}ms")
+                if first_call:
+                    first_call = False
+                
+                return result
+
+            #Last stable version
+            # @wraps(func)
+            # def wrapper(std: float, *args, **kwargs):
+            #     nonlocal first_call
+            #     #print(f"Debug - std: {std}, args: {args}, kwargs: {kwargs}")  # Debug print
+            #     device = kwargs['reference'].device.type if 'reference' in kwargs else 'cpu'
+
+            #     # Print std value only on first call
+            #     if first_call:
+            #         print(f"\nNoise Generation std parameter: {std}")
+            #         first_call = False
+                
+            #     # Commented out to start timer closer to result
+            #     # self.synchronize_device()    
+            #     # start = time.perf_counter()
+
+            #     # Modify the call to handle CPU generator
+            #     if 'generator' in kwargs and kwargs['generator'] is not None:
+            #         # Get reference tensor from kwargs
+            #         ref_tensor = kwargs.get('reference', None)
+            #         if ref_tensor is not None:
+            #             ref_device = ref_tensor.device
+            #             with torch.no_grad():
+            #                 self.synchronize_device(self.config.device)    
+            #                 start = time.perf_counter()
+
+            #                 kwargs['reference'] = ref_tensor.cpu()  # Move reference to CPU
+            #                 result = func(std, **kwargs)
+            #                 result = result.to(ref_device)  # Move result back to original device
+            #         else:
+            #             self.synchronize_device(self.config.device)    
+            #             start = time.perf_counter()
+
+            #             result = func(std, **kwargs)
+            #     else:
+            #         self.synchronize_device(self.config.device)    
+            #         start = time.perf_counter()
+
+            #         result = func(std, **kwargs)
                 
                 self.synchronize_device(self.config.device)
                 duration = (time.perf_counter() - start) * 1000

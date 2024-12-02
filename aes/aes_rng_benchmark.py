@@ -38,7 +38,7 @@ def benchmark_rngs(sizes: List[int], repeat: int = 10) -> Dict:
         
         # PyTorch default RNG
         mean, std = time_operation(
-            lambda: torch.rand(size, generator=torch_gen),
+            lambda: torch.randn(size, generator=torch_gen),
             repeat
         )
         results['pytorch']['mean'].append(mean)
@@ -46,7 +46,7 @@ def benchmark_rngs(sizes: List[int], repeat: int = 10) -> Dict:
         
         # AES RNG
         mean, std = time_operation(
-            lambda: aes_gen.rand(size),
+            lambda: aes_gen.randn(size),
             repeat
         )
         results['aes']['mean'].append(mean)
@@ -90,9 +90,9 @@ if __name__ == "__main__":
     
     # Print summary
     print("\nResults Summary:")
-    print("-" * 50)
+    print("-" * 60)
     print(f"{'Size':<10} {'PyTorch (ms)':<20} {'AES (ms)':<20}")
-    print("-" * 50)
+    print("-" * 60)
     for i, size in enumerate(results['sizes']):
         print(f"{size:<10} "
               f"{results['pytorch']['mean'][i]:>8.3f} ± {results['pytorch']['std'][i]:<8.3f} "
