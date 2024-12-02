@@ -1,20 +1,27 @@
+#Basic libraries for data, timing, profiling, and statistics
+import json
+import csv
+import numpy as np
+from pathlib import Path
+from datetime import datetime
+import time
+from functools import wraps
+from dataclasses import dataclass, asdict
+from typing import Optional, Tuple, Dict
+from contextlib import contextmanager
+import statistics
+import psutil
+# PyTorch and Opacus imports 
 import torch
 import torch.nn as nn
 from torch.func import vmap, grad, functional_call
-import time
-from functools import wraps
-from dataclasses import dataclass
-from typing import Optional, Tuple, Dict
-import psutil
-import numpy as np
-from contextlib import contextmanager
-import statistics
 from opacus import PrivacyEngine
 from opacus.validators import ModuleValidator
-from model import DPTransformerEncoder, DPResNet, ModelConfig, create_dp_resnet18
 from opacus.optimizers.optimizer import _generate_noise
 import opacus.optimizers.optimizer as opacus_opt
 from opacus.utils.batch_memory_manager import BatchMemoryManager
+# Model and custom Generator/PrivacyEngine imports
+from model import DPTransformerEncoder, DPResNet, ModelConfig, create_dp_resnet18
 from aes_prng import BatchedAESRandomGenerator, BatchedMPSAESRandomGenerator, AESPrivacyEngine
 
 @dataclass
@@ -26,7 +33,7 @@ class BenchmarkConfig(ModelConfig):
     warmup_iterations: int = 10
     poisson_sampling: bool = True
     device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-    privacy_engine : PrivacyEngine = PrivacyEngine()
+    privacy_engine_type : str = "standard"
 
 @contextmanager
 def timer(name: str, stats_dict: Dict[str, list], device: str):
@@ -94,36 +101,36 @@ class DPSGDBenchmark:
                     print("Generator: {}".format(kwargs['generator']))
                     #first_call = False
                 
-                # Time each part separately
-                start_total = time.perf_counter()
-                
                 # Synchronize and time pre-generation
                 if device == "mps":
                     torch.mps.synchronize()
                 elif device == "cuda":
                     torch.cuda.synchronize()
-                
-                start_gen = time.perf_counter()
-                
+
+                # Time each part separately
+                start = time.perf_counter()
+                                
                 # Modify the call to handle CPU generator
-                if 'generator' in kwargs and kwargs['generator'] is not None:
+                if std == 0 or kwargs['generator'] is None:
+                    result = func(std, **kwargs)
+                elif 'generator' in kwargs and kwargs['generator'] is not None:
                     ref_device = ref_tensor.device
                     with torch.no_grad():
-                        t1 = time.perf_counter()
+                        #t1 = time.perf_counter()
                         kwargs['reference'] = ref_tensor.cpu() 
-                        t2 = time.perf_counter()
+                        #t2 = time.perf_counter()
                         result = func(std, **kwargs)
-                        t3 = time.perf_counter()
+                        #t3 = time.perf_counter()
                         result = result.to(ref_device)
-                        t4 = time.perf_counter()
+                        #t4 = time.perf_counter()
                         
-                        if first_call:
-                            print(f"Debug timings:")
-                            print(f"  To CPU: {(t2-t1)*1000:.3f}ms")
-                            print(f"  Generate: {(t3-t2)*1000:.3f}ms")
-                            print(f"  To Device: {(t4-t3)*1000:.3f}ms")
-                else:
-                    result = func(std, **kwargs)
+                        # if first_call:
+                        #     print(f"Debug timings:")
+                        #     print(f"  To CPU: {(t2-t1)*1000:.3f}ms")
+                        #     print(f"  Generate: {(t3-t2)*1000:.3f}ms")
+                        #     print(f"  To Device: {(t4-t3)*1000:.3f}ms")
+                # else:
+                #     result = func(std, **kwargs)
                 
                 # Synchronize and time post-generation
                 if device == "mps":
@@ -131,8 +138,7 @@ class DPSGDBenchmark:
                 elif device == "cuda":
                     torch.cuda.synchronize()
                     
-                duration = (time.perf_counter() - start_total) * 1000
-                gen_time = (time.perf_counter() - start_gen) * 1000
+                duration = (time.perf_counter() - start) * 1000
                 
                 if std == 0:
                     noise_stats['noise_generation_zero'].append(duration)
@@ -140,7 +146,8 @@ class DPSGDBenchmark:
                     noise_stats['noise_generation_nonzero'].append(duration)
                     if first_call:
                         print(f"Total time: {duration:.3f}ms")
-                        print(f"Generation time: {gen_time:.3f}ms")
+                        #print(f"Generation time: {gen_time:.3f}ms")
+                
                 if first_call:
                     first_call = False
                 
@@ -220,8 +227,11 @@ class DPSGDBenchmark:
         self.criterion = nn.CrossEntropyLoss(reduction='none')
         
         # Initialize privacy engine with a dummy data loader
-        print("Initializing privacy engine of type {}".format(type(config.privacy_engine)))
-        self.privacy_engine = config.privacy_engine
+        if config.privacy_engine_type == "aes":
+            self.privacy_engine = AESPrivacyEngine()
+        else:
+            self.privacy_engine = PrivacyEngine()
+        print("Initializing privacy engine of type {}".format(type(self.privacy_engine)))
         
         # Create dummy data loader with correct batch size
         dummy_data = torch.utils.data.DataLoader(
@@ -473,7 +483,11 @@ class DPSGDBenchmark:
                 'max_gpu_driver': results[variant]['max_gpu_driver'],
                 'throughput': self.config.batch_size / np.mean(results[variant]['time'])
             }
-                
+        
+        # Store raw results in class attributes for later access
+        self.raw_results = results  # Store the raw per-iteration results
+        self.summary_results = summary  # Store the computed summary
+        
         return summary
 
     def print_timing_statistics(self):
@@ -491,9 +505,85 @@ class DPSGDBenchmark:
                 std_time = statistics.stdev(times) if len(times) > 1 else 0
                 print(f"{key:30s}: {mean_time:8.4f} ± {std_time:6.4f}")
 
-def main(model_type = "transformer", poisson_sampling = True, privacy_engine = PrivacyEngine()):
+    def save_results(self, output_dir="results"):
+        """Save all benchmark data to disk"""
+        if not hasattr(self, 'summary_results'):
+            raise RuntimeError("Must run benchmark before saving results")
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = Path(output_dir)
+        run_dir = output_dir / f"run_{timestamp}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save configuration
+        config_dict = asdict(self.config)
+        with open(run_dir / "config.json", 'w') as f:
+            json.dump(config_dict, f, indent=4)
+        
+        # Save summary results
+        with open(run_dir / "summary.json", 'w') as f:
+            json.dump(self.summary_results, f, indent=4, default=float)
+        
+        # Save raw iteration data
+        with open(run_dir / "raw_results.json", 'w') as f:
+            json.dump(self.raw_results, f, indent=4, default=float)
+        
+        # Save detailed timing data
+        timing_data = {
+            'operation': [],
+            'time_ms': [],
+            'run_number': []
+        }
+        
+        for operation, times in self.timing_stats.items():
+            for i, t in enumerate(times):
+                timing_data['operation'].append(operation)
+                timing_data['time_ms'].append(t)
+                timing_data['run_number'].append(i)
+        
+        with open(run_dir / "timing_details.csv", 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=timing_data.keys())
+            writer.writeheader()
+            for i in range(len(timing_data['operation'])):
+                writer.writerow({k: timing_data[k][i] for k in timing_data.keys()})
+        
+        # Save noise generation stats
+        noise_data = {
+            'operation': [],
+            'time_ms': [],
+            'run_number': []
+        }
+        
+        for operation, times in self.wrapped_noise_gen.noise_stats.items():
+            for i, t in enumerate(times):
+                noise_data['operation'].append(operation)
+                noise_data['time_ms'].append(t)
+                noise_data['run_number'].append(i)
+        
+        with open(run_dir / "noise_generation_details.csv", 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=noise_data.keys())
+            writer.writeheader()
+            for i in range(len(noise_data['operation'])):
+                writer.writerow({k: noise_data[k][i] for k in noise_data.keys()})
+        
+        # Save all data in NPZ format
+        np.savez(
+            run_dir / "all_data.npz",
+            config=config_dict,
+            summary=self.summary_results,
+            raw_results=self.raw_results,
+            timing_details=timing_data,
+            noise_details=noise_data
+        )
+        
+        return run_dir
+
+def main(model_type = "transformer", poisson_sampling = True, privacy_engine_type = "aes"):
     # Run one model at a time based on command line argument or config
-    config = BenchmarkConfig(model_type=model_type, poisson_sampling=poisson_sampling, privacy_engine=privacy_engine)
+    config = BenchmarkConfig(
+        model_type=model_type, 
+        poisson_sampling=poisson_sampling, 
+        privacy_engine_type=privacy_engine_type)
     
     print(f"\nRunning {config.model_type} benchmark {'WITH' if config.poisson_sampling else 'WITHOUT'} poisson subsampling")
     benchmark = DPSGDBenchmark(config)
@@ -531,6 +621,13 @@ def main(model_type = "transformer", poisson_sampling = True, privacy_engine = P
     print("\nDetailed Timing Statistics:")
     print("-" * 80)
     benchmark.print_timing_statistics()
+
+    # Save all results
+    try:
+        run_dir = benchmark.save_results()
+        print(f"\nResults saved to: {run_dir}")
+    except Exception as e:
+        print(f"Error saving results: {e}")
 
 if __name__ == "__main__":
     main()

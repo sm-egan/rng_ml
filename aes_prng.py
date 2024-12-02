@@ -6,6 +6,8 @@ from typing import Optional, Tuple, Union, Dict, Any
 from collections import deque
 from opacus import PrivacyEngine
 import warnings
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
 
 class BatchedAESRandomGenerator:
     """AES-CTR based RNG with batch generation and caching"""
@@ -157,6 +159,54 @@ class AESGenerator(torch.Generator):
             
         return tensor
 
+class HWAccelBatchedAESRandomGenerator(BatchedAESRandomGenerator):
+    """AES-CTR RNG that uses hardware acceleration when available"""
+    def __init__(self, device: Optional[torch.device] = None,
+                 batch_size: int = 10_000_000,
+                 max_cache_batches: int = 2):
+        self.device = device if device is not None else torch.device('cpu')
+        self.batch_size = batch_size
+        self.max_cache_batches = max_cache_batches
+        
+        # Initialize AES with appropriate nonce size
+        self.key = get_random_bytes(16)
+        # CTR mode requires 16-byte nonce for cryptography library
+        self.nonce = get_random_bytes(16)  # Changed from 8 to 16
+        self._init_cipher()
+        
+        # Initialize cache
+        self.cache = deque(maxlen=max_cache_batches)
+        self._current_batch = None
+        self._current_idx = 0
+
+    def _init_cipher(self):
+        """Override cipher initialization to use cryptography library"""
+        # Create cipher using hardware backend
+        self.cipher = Cipher(
+            algorithms.AES(self.key),
+            modes.CTR(self.nonce),  # No need to pad, using 16 bytes directly
+            backend=default_backend()
+        ).encryptor()
+    
+    def _generate_batch(self) -> torch.Tensor:
+        """Generate a batch of random numbers using hardware acceleration"""
+        # Generate random bytes using hardware-accelerated AES
+        random_bytes = self.cipher.update(b'\0' * (self.batch_size * 4))
+        
+        # Convert to float tensor efficiently (same as parent)
+        array = np.frombuffer(random_bytes, dtype=np.uint32).astype(float)
+        array /= np.uint32(0xffffffff)
+        
+        return torch.from_numpy(array)
+
+# Create a hardware-accelerated version of the main Generator
+class HWAccelAESGenerator(AESGenerator):
+    """AES Generator that uses hardware acceleration"""
+    def __init__(self):
+        super().__init__()
+        # Override the generator to use hardware-accelerated version
+        self._generator = HWAccelBatchedAESRandomGenerator(device='cpu')
+
 class AESPrivacyEngine(PrivacyEngine):
     """Privacy Engine that uses AES-CTR for secure random number generation"""
     def __init__(
@@ -175,7 +225,7 @@ class AESPrivacyEngine(PrivacyEngine):
         if self.secure_mode:
             # Create CPU generator - it will handle device transfers internally
             print("Secure mode activated...")
-            self.secure_rng = AESGenerator()
+            self.secure_rng = HWAccelAESGenerator()
         else:
             warnings.warn(
                 "Secure RNG turned off. This is perfectly fine for experimentation as it allows "
