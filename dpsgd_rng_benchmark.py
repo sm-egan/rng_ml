@@ -491,7 +491,7 @@ class DPSGDBenchmark:
                 std_time = statistics.stdev(times) if len(times) > 1 else 0
                 print(f"{key:30s}: {mean_time:8.4f} ± {std_time:6.4f}")
 
-def main(model_type = "transformer", poisson_sampling = True, privacy_engine = AESPrivacyEngine()):
+def main(model_type = "transformer", poisson_sampling = True, privacy_engine = PrivacyEngine()):
     # Run one model at a time based on command line argument or config
     config = BenchmarkConfig(model_type=model_type, poisson_sampling=poisson_sampling, privacy_engine=privacy_engine)
     
