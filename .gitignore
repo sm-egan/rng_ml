@@ -24,3 +24,6 @@ dist/
 # Torch specific
 *.pt
 *.pth
+
+# Jupyter Notebook
+.ipynb_checkpoints/
