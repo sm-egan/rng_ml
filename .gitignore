@@ -4,9 +4,6 @@
 .DS_Store
 .idea/
 .vscode/
-results/
-plotting/
-aes/
 
 # Python virtual environment
 rng_accel_env/
@@ -16,13 +13,25 @@ rng_accel_env/
 
 # Python artifacts
 __pycache__/
-*.py[cod]
 *$py.class
 *.so
 build/
 dist/
 *.egg-info/
+.ipynb_checkpoints/
 
 # Torch specific
 *.pt
 *.pth
+
+# Output directories
+results/
+examples/**/*.csv
+examples/**/*.npz
+examples/**/*.json
+
+# Temporary data files
+*.csv
+*.json
+*.npy
+*.npz

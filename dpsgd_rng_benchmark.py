@@ -115,7 +115,7 @@ class DPSGDBenchmark:
                 if first_call:
                     print(f"\nNoise Generation std parameter: {std}")
                     print(f"Generator: {kwargs['generator']}")
-                    #first_call = False
+                    first_call = False
                 
                 # Synchronize and time pre-generation
                 if device == "mps":
@@ -149,10 +149,6 @@ class DPSGDBenchmark:
                     noise_stats['noise_generation_zero'][size_key].append(duration)
                 else:
                     noise_stats['noise_generation_nonzero'][size_key].append(duration)
-                
-                if first_call:
-                    print(f"Total time: {duration:.3f}ms")
-                    first_call = False
                     
                 return result
                 
@@ -461,38 +457,43 @@ class DPSGDBenchmark:
         """Print detailed timing statistics including tensor size breakdown"""
         # Regular timing stats
         print("\nForward/Backward Pass and Optimizer Timing Statistics:")
-        print("-" * 50)
+        print("-" * 60)
         for operation, times in self.timing_stats.items():
             mean_time = statistics.mean(times)
             std_time = statistics.stdev(times) if len(times) > 1 else 0
             print(f"{operation:30s}: {mean_time:8.2f} ± {std_time:6.2f}")
 
-        # Print noise generation stats by tensor size
-        all_zero_times = []
-        all_nonzero_times = []
-        for times in self.wrapped_noise_gen.noise_stats['noise_generation_zero'].values():
-            all_zero_times.extend(times)
-        for times in self.wrapped_noise_gen.noise_stats['noise_generation_nonzero'].values():
-            all_nonzero_times.extend(times)
+        # Print average of all noise tensor sizes
+        ## Commented out because the average over all call isn't representative of noise gen time. 
+        ## Many calls are made per training step
+
+        # print("\nNoise Generation Timing Statistics:")
+        # print("-" * 50) 
+        # all_zero_times = []
+        # all_nonzero_times = []
+        # for times in self.wrapped_noise_gen.noise_stats['noise_generation_zero'].values():
+        #     all_zero_times.extend(times)
+        # for times in self.wrapped_noise_gen.noise_stats['noise_generation_nonzero'].values():
+        #     all_nonzero_times.extend(times)
         
-        print("\nNoise Generation Timing Statistics:")
-        print("-" * 50)
-        if all_zero_times:
-            mean_zero = statistics.mean(all_zero_times)
-            std_zero = statistics.stdev(all_zero_times) if len(all_zero_times) > 1 else 0
-            print(f"{'noise_generation_zero':30s}: {mean_zero:8.2f} ± {std_zero:6.2f}")
-        if all_nonzero_times:
-            mean_nonzero = statistics.mean(all_nonzero_times)
-            std_nonzero = statistics.stdev(all_nonzero_times) if len(all_nonzero_times) > 1 else 0
-            print(f"{'noise_generation_nonzero':30s}: {mean_nonzero:8.2f} ± {std_nonzero:6.2f}")
+        # if all_zero_times:
+        #     mean_zero = statistics.mean(all_zero_times)
+        #     std_zero = statistics.stdev(all_zero_times) if len(all_zero_times) > 1 else 0
+        #     print(f"{'noise_generation_zero':30s}: {mean_zero:8.2f} ± {std_zero:6.2f}")
+        # if all_nonzero_times:
+        #     mean_nonzero = statistics.mean(all_nonzero_times)
+        #     std_nonzero = statistics.stdev(all_nonzero_times) if len(all_nonzero_times) > 1 else 0
+        #     print(f"{'noise_generation_nonzero':30s}: {mean_nonzero:8.2f} ± {std_nonzero:6.2f}")
         
-        # Detailed noise generation stats by tensor size        
+        # Detailed noise generation stats by tensor size   
+        print("\nNoise Generation Timing Statistics by Tensor Size:")
+        print("-" * 60)     
         # Get all unique tensor sizes
         tensor_sizes = set(
             list(self.wrapped_noise_gen.noise_stats['noise_generation_zero'].keys()) +
             list(self.wrapped_noise_gen.noise_stats['noise_generation_nonzero'].keys())
         )
-        
+
         for size in tensor_sizes:
             print(f"\nTensor size: {size}")
             
@@ -501,14 +502,33 @@ class DPSGDBenchmark:
                 times = self.wrapped_noise_gen.noise_stats['noise_generation_zero'][size]
                 mean_time = statistics.mean(times)
                 std_time = statistics.stdev(times) if len(times) > 1 else 0
-                print(f"Zero noise:     {mean_time:8.4f} ± {std_time:6.4f} ms")
+                calls_per_iter = len(times) / self.config.num_iterations
+                print(f"Zero noise:     {mean_time:8.4f} ± {std_time:6.4f} ms  ({calls_per_iter:.3f} calls/iter)")
             
             # Nonzero noise stats
             if size in self.wrapped_noise_gen.noise_stats['noise_generation_nonzero']:
                 times = self.wrapped_noise_gen.noise_stats['noise_generation_nonzero'][size]
                 mean_time = statistics.mean(times)
                 std_time = statistics.stdev(times) if len(times) > 1 else 0
-                print(f"Nonzero noise:  {mean_time:8.4f} ± {std_time:6.4f} ms")
+                calls_per_iter = round(len(times) / self.config.num_iterations)
+                print(f"Nonzero noise:  {mean_time:8.4f} ± {std_time:6.4f} ms  ({calls_per_iter:.3f} calls/iter)")
+        
+        # for size in tensor_sizes:
+        #     print(f"\nTensor size: {size}")
+            
+        #     # Zero noise stats
+        #     if size in self.wrapped_noise_gen.noise_stats['noise_generation_zero']:
+        #         times = self.wrapped_noise_gen.noise_stats['noise_generation_zero'][size]
+        #         mean_time = statistics.mean(times)
+        #         std_time = statistics.stdev(times) if len(times) > 1 else 0
+        #         print(f"Zero noise:     {mean_time:8.4f} ± {std_time:6.4f} ms")
+            
+        #     # Nonzero noise stats
+        #     if size in self.wrapped_noise_gen.noise_stats['noise_generation_nonzero']:
+        #         times = self.wrapped_noise_gen.noise_stats['noise_generation_nonzero'][size]
+        #         mean_time = statistics.mean(times)
+        #         std_time = statistics.stdev(times) if len(times) > 1 else 0
+        #         print(f"Nonzero noise:  {mean_time:8.4f} ± {std_time:6.4f} ms")
 
     def save_results(self, output_dir="results"):
         """Save benchmark results including per-run tensor size statistics"""
@@ -610,7 +630,7 @@ class DPSGDBenchmark:
         
         return run_dir
 
-def main(output_dir = "results", model_type = "transformer", poisson_sampling = True, privacy_engine_type = "aes"):
+def main(output_dir = "results", model_type = "transformer", poisson_sampling = True, privacy_engine_type = "standard"):
     # Run one model at a time based on command line argument or config
     config = BenchmarkConfig(
         model_type=model_type, 
