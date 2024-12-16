@@ -164,6 +164,7 @@ class HWAccelBatchedAESRandomGenerator(BatchedAESRandomGenerator):
     def __init__(self, device: Optional[torch.device] = None,
                  batch_size: int = 10_000_000,
                  max_cache_batches: int = 2):
+        #super().__init__()
         self.device = device if device is not None else torch.device('cpu')
         self.batch_size = batch_size
         self.max_cache_batches = max_cache_batches
@@ -203,7 +204,7 @@ class HWAccelBatchedAESRandomGenerator(BatchedAESRandomGenerator):
 class HWAccelAESGenerator(AESGenerator):
     """AES Generator that uses hardware acceleration"""
     def __init__(self):
-        super().__init__()
+        #super().__init__()
         # Override the generator to use hardware-accelerated version
         self._generator = HWAccelBatchedAESRandomGenerator(device='cpu')
 

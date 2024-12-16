@@ -5,6 +5,8 @@
 .idea/
 .vscode/
 results/
+plotting/
+aes/
 
 # Python virtual environment
 rng_accel_env/

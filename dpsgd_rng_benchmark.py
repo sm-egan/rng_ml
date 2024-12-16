@@ -29,7 +29,7 @@ class BenchmarkConfig(ModelConfig):
     """Configuration for benchmark runs, inheriting from ModelConfig"""
     max_grad_norm: float = 1.0
     noise_multiplier: float = 1.0
-    num_iterations: int = 1000
+    num_iterations: int = 100
     warmup_iterations: int = 10
     poisson_sampling: bool = True
     device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
@@ -610,7 +610,7 @@ class DPSGDBenchmark:
         
         return run_dir
 
-def main(output_dir = "results", model_type = "resnet", poisson_sampling = True, privacy_engine_type = "aes"):
+def main(output_dir = "results", model_type = "transformer", poisson_sampling = True, privacy_engine_type = "aes"):
     # Run one model at a time based on command line argument or config
     config = BenchmarkConfig(
         model_type=model_type, 
