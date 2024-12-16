@@ -4,8 +4,8 @@ import torch
 import time
 from collections import defaultdict
 
-class RNGBenchmarkV4:
-    def __init__(self, sizes=[np.power(10,n) for n in range(3, 9)]):
+class RNGBenchmark:
+    def __init__(self, sizes=[np.power(10,n) for n in range(4, 10)]):
         self.sizes = sizes
         self.warmup_rounds = 5
         
@@ -245,7 +245,7 @@ class RNGBenchmarkV4:
                 
 
 if __name__ == "__main__":
-    benchmark = RNGBenchmarkV4()
+    benchmark = RNGBenchmark()
     results = benchmark.run_benchmarks()
     benchmark.print_results(results)
     benchmark.save_results(results, 'results/rng_benchmark.json')
