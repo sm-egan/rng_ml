@@ -35,3 +35,21 @@ examples/**/*.json
 *.json
 *.npy
 *.npz
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints/
+*.ipynb_meta/
+
+# Environment
+requirements.lock
+pip-log.txt
+
+# Shell scripts output and logs
+*.out
+*.err
+nohup.out
+
+# Temporary files
+tmp/
+temp/
