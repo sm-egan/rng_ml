@@ -11,6 +11,7 @@ from typing import Optional, Tuple, Dict
 from contextlib import contextmanager
 import statistics
 import psutil
+import argparse
 # PyTorch and Opacus imports 
 import torch
 import torch.nn as nn
@@ -630,15 +631,38 @@ class DPSGDBenchmark:
         
         return run_dir
 
-def main(output_dir = "results", model_type = "transformer", poisson_sampling = True, privacy_engine_type = "standard"):
+def main():
+    # Set up argument parser
+    parser = argparse.ArgumentParser(description='Run DP-SGD benchmark with different RNG configurations')
+    parser.add_argument('--model_type', type=str, default='transformer',
+                      choices=['transformer', 'resnet'],
+                      help='Model architecture to benchmark (transformer or resnet)')
+    parser.add_argument('--poisson_sampling', type=lambda x: x.lower() == 'true',
+                      default=True,
+                      help='Whether to use Poisson sampling (true/false)')
+    parser.add_argument('--privacy_engine_type', type=str,
+                      default='standard',
+                      choices=['standard', 'aes'],
+                      help='Type of privacy engine to use (standard or aes)')
+    parser.add_argument('--output_dir', type=str,
+                      default='results',
+                      help='Directory to save results')
+
+    args = parser.parse_args()
+    
+    print(f"\nStarting benchmark with configuration:")
+    print(f"Model type: {args.model_type}")
+    print(f"Poisson sampling: {args.poisson_sampling}")
+    print(f"Privacy engine: {args.privacy_engine_type}")
+    print(f"Output directory: {args.output_dir}\n")
+
     # Run one model at a time based on command line argument or config
     config = BenchmarkConfig(
-        model_type=model_type, 
-        poisson_sampling=poisson_sampling, 
-        privacy_engine_type=privacy_engine_type)
+        model_type=args.model_type,
+        poisson_sampling=args.poisson_sampling,
+        privacy_engine_type=args.privacy_engine_type)
     
-    print(f"\nRunning {config.model_type} benchmark {'WITH' if config.poisson_sampling else 'WITHOUT'} poisson subsampling")
-    #benchmark = DPSGDBenchmark(config)
+    #print(f"\nRunning {config.model_type} benchmark {'WITH' if config.poisson_sampling else 'WITHOUT'} poisson subsampling")
     with DPSGDBenchmark(config) as benchmark:
         results = benchmark.run_benchmark()
         
