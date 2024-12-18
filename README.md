@@ -77,10 +77,11 @@ results/
 
 If you use this benchmark in your research, please cite our paper:
 ```bibtex
-@inproceedings{egan2024highspeed,
+@inproceedings{egan2024,
   title={High-speed secure random number generator co-processors for privacy-preserving machine learning},
   author={Egan, Shannon},
   booktitle={Second Workshop on Machine Learning with New Compute Paradigms at NeurIPS},
-  year={2024}
+  year={2024},
+  url={https://openreview.net/pdf?id=8oraBCaYbm}
 }
 ```
