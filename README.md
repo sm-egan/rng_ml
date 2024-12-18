@@ -30,8 +30,8 @@ The generators use batch generation and caching to improve performance, generati
 
 1. First, set up your Python environment:
 ```bash
-python -m venv rng_accel_env
-source rng_accel_env/bin/activate  # On Unix/macOS
+python -m venv dpsgd_rng_env
+source dpsgd_rng_env/bin/activate  # On Unix/macOS
 pip install -r requirements.txt
 ```
 

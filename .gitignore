@@ -6,7 +6,7 @@
 .vscode/
 
 # Python virtual environment
-rng_accel_env/
+dpsgd_rng_env/
 .env
 .venv/
 *.pyenv
