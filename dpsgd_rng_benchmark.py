@@ -699,7 +699,7 @@ def main():
 
         # Save all results
         try:
-            run_dir = benchmark.save_results(output_dir)
+            run_dir = benchmark.save_results(args.output_dir)
             print(f"\nResults saved to: {run_dir}")
         except Exception as e:
             print(f"Error saving results: {e}")
